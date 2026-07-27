@@ -1,6 +1,7 @@
 import argparse
 import sys
 
+from udockerd import udocker_ctx
 from udockerd.config import check_curl_available, configure_udocker
 from udockerd.server import serve
 
@@ -13,6 +14,7 @@ def main() -> int:
 
     check_curl_available()
     configure_udocker()
+    udocker_ctx.init()
 
     serve(args.host, args.port)
     return 0

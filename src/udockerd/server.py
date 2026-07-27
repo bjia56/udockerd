@@ -1,10 +1,11 @@
 from udockerd.http import Router, ThreadingHTTPServer, make_handler_class
-from udockerd.routes import system
+from udockerd.routes import images, system
 
 
 def build_router() -> Router:
     router = Router()
     system.register(router)
+    images.register(router)
     return router
 
 

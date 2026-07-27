@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 dependencies = [
-    "udocker>=1.3.17",
+    # Pinned exact: udockerd reaches into udocker's internal classes
+    # (LocalRepo, DockerIoAPI, ContainerStructure, engines), not just its
+    # CLI, so an unpinned upgrade could silently break us.
+    "udocker==1.3.17",
 ]
 
 [project.scripts]
