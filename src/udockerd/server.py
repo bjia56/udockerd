@@ -1,11 +1,17 @@
+import signal
+import threading
+from types import FrameType
+
+from udockerd import container_proc
 from udockerd.http import Router, ThreadingHTTPServer, make_handler_class
-from udockerd.routes import images, system
+from udockerd.routes import containers, images, system
 
 
 def build_router() -> Router:
     router = Router()
     system.register(router)
     images.register(router)
+    containers.register(router)
     return router
 
 
@@ -13,9 +19,26 @@ def serve(host: str, port: int) -> None:
     router = build_router()
     handler_cls = make_handler_class(router)
     httpd = ThreadingHTTPServer((host, port), handler_cls)
+
+    def shutdown_gracefully() -> None:
+        # Graceful path: SIGTERM each running container's process group,
+        # wait, then SIGKILL stragglers, before the daemon itself exits.
+        # Complements the process supervisor's own PDEATHSIG-triggered
+        # cleanup, which covers the case this never runs at all (e.g.
+        # SIGKILL to the daemon).
+        container_proc.stop_all()
+        httpd.shutdown()
+
+    def handle_sigterm(signum: int, frame: FrameType | None) -> None:
+        # httpd.shutdown() blocks until serve_forever()'s loop (running on
+        # this same thread) notices the shutdown flag and returns — which
+        # can't happen while we're still inside this handler. Run it on a
+        # separate thread instead of inline.
+        threading.Thread(target=shutdown_gracefully, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        httpd.shutdown()
+        shutdown_gracefully()

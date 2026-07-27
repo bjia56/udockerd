@@ -128,6 +128,7 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str) -> Any:
             proc.pgid = popen_proc.pid
             proc.status = "running"
             proc.started_at = time.time()
+            proc.lock.notify_all()
         return popen_proc
 
     return _patched_popen
@@ -145,7 +146,12 @@ class ContainerProc:
     logfile: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    # engine.opt overrides captured at /containers/create time (cmd, env,
+    # user, cwd, ...) and applied when /start actually spawns the process.
+    opt: dict[str, Any] = field(default_factory=dict)
+    # A Condition (not a plain Lock) so /wait can block until status
+    # changes via notify_all() instead of polling.
+    lock: threading.Condition = field(default_factory=threading.Condition)
 
 
 class ContainerRegistry:
@@ -157,9 +163,18 @@ class ContainerRegistry:
         with self._lock:
             self._containers[proc.container_id] = proc
 
-    def get(self, container_id: str) -> ContainerProc | None:
+    def get(self, id_or_name: str) -> ContainerProc | None:
+        """Docker API endpoints accept either the container id or its
+        name interchangeably (e.g. `docker logs mytest`); resolve both.
+        """
         with self._lock:
-            return self._containers.get(container_id)
+            proc = self._containers.get(id_or_name)
+            if proc is not None:
+                return proc
+            for candidate in self._containers.values():
+                if candidate.name == id_or_name:
+                    return candidate
+            return None
 
     def remove(self, container_id: str) -> None:
         with self._lock:
@@ -184,27 +199,25 @@ def _run_engine_patched(
             subprocess.Popen = _original_popen  # type: ignore[misc]
 
 
-def spawn(
-    container_id: str,
-    name: str,
-    image: str,
-    logfile: str,
-    opt: dict[str, Any],
-) -> ContainerProc:
+def spawn(proc: ContainerProc) -> None:
     """Starts engine.run() in a background thread so the API call that
     triggered it (POST /containers/{id}/start) can return immediately,
     the same way the real Docker daemon does.
 
-    `opt` overrides engine.opt entries (cmd, env, vol, user, cwd, ...) —
-    the same fields udocker's own cmdp/CLI-argument parsing would set,
+    Mutates the given (already-registered, created by /containers/create)
+    ContainerProc in place rather than constructing a new one, so any
+    existing reference to it (e.g. a concurrent /wait call already
+    blocked on its condition variable) keeps observing the same object.
+
+    proc.opt overrides engine.opt entries (cmd, env, vol, user, cwd, ...)
+    — the same fields udocker's own cmdp/CLI-argument parsing would set,
     which we bypass to drive the engine programmatically from Docker API
     request JSON instead.
     """
     uctx = udocker_ctx.get()
     supervisor_path = str(supervisor.ensure_supervisor())
-
-    proc = ContainerProc(container_id=container_id, name=name, image=image, logfile=logfile)
-    registry.add(proc)
+    container_id = proc.container_id
+    opt = proc.opt
 
     def target() -> None:
         exec_mode = ExecutionMode(uctx.local, container_id)
@@ -216,21 +229,18 @@ def spawn(
             proc.status = "exited"
             proc.exit_code = exit_code
             proc.finished_at = time.time()
+            proc.lock.notify_all()
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
 
-    # Poll the registry entry briefly for the pid/pgid the patched Popen
-    # call fills in; falls through (still "created") if the engine never
-    # reaches a Popen call within the timeout, e.g. a setup error.
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        with proc.lock:
-            if proc.pid is not None or proc.status == "exited":
-                break
-        time.sleep(0.05)
-
-    return proc
+    # Wait briefly for the pid/pgid the patched Popen call fills in (or
+    # for an immediate failure); falls through (still "created") if the
+    # engine never reaches a Popen call within the timeout, e.g. a setup
+    # error. notify_all() from _make_patched_popen/target wakes this
+    # immediately rather than polling.
+    with proc.lock:
+        proc.lock.wait_for(lambda: proc.pid is not None or proc.status == "exited", timeout=10)
 
 
 def stop(proc: ContainerProc, grace_seconds: float = 10.0) -> None:
@@ -249,12 +259,10 @@ def stop(proc: ContainerProc, grace_seconds: float = 10.0) -> None:
     except ProcessLookupError:
         return
 
-    deadline = time.time() + grace_seconds
-    while time.time() < deadline:
-        with proc.lock:
-            if proc.status == "exited":
-                return
-        time.sleep(0.1)
+    with proc.lock:
+        exited = proc.lock.wait_for(lambda: proc.status == "exited", timeout=grace_seconds)
+    if exited:
+        return
 
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, signal.SIGKILL)
