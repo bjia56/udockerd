@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import signal
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 from udocker.container.structure import ContainerStructure
 
 from udockerd import container_proc, udocker_ctx
+from udockerd.routes import exec as exec_routes
 
 if TYPE_CHECKING:
     from udockerd.container_proc import ContainerProc
@@ -48,32 +51,6 @@ def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
         if candidate != imagerepo and uctx.local.cd_imagerepo(candidate, tag):
             return candidate, tag
     return None
-
-
-def _container_opt_from_body(body: dict[str, Any]) -> dict[str, Any]:
-    """Maps Docker API container-create request JSON to udocker engine
-    opt fields. Only covers the fields udocker's engines actually read
-    (see container_proc.py); silently ignores Docker API fields with no
-    proot/fakechroot equivalent (e.g. resource limits) rather than
-    erroring, since there's no meaningful way to honor them here.
-    """
-    opt: dict[str, Any] = {}
-    cmd = body.get("Cmd")
-    if cmd:
-        opt["cmd"] = list(cmd)
-    entrypoint = body.get("Entrypoint")
-    if entrypoint:
-        opt["entryp"] = entrypoint if isinstance(entrypoint, str) else " ".join(entrypoint)
-    env = body.get("Env")
-    if env:
-        opt["env"] = list(env)
-    workdir = body.get("WorkingDir")
-    if workdir:
-        opt["cwd"] = workdir
-    user = body.get("User")
-    if user:
-        opt["user"] = user
-    return opt
 
 
 def _summary(proc: ContainerProc) -> dict[str, Any]:
@@ -149,7 +126,7 @@ def create(ctx: RequestContext) -> None:
         name=display_name,
         image=image,
         logfile=str(_LOG_DIR / f"{container_id}.log"),
-        opt=_container_opt_from_body(body),
+        opt=container_proc.opt_from_request_body(body),
     )
     container_proc.registry.add(proc)
 
@@ -180,6 +157,28 @@ def stop(ctx: RequestContext) -> None:
     query = _query(ctx)
     grace = float(query.get("t", ["10"])[0])
     container_proc.stop(proc, grace_seconds=grace)
+    exec_routes.stop_execs_for(proc.container_id, grace_seconds=grace)
+    ctx.send_empty(204)
+
+
+def kill(ctx: RequestContext) -> None:
+    """Unlike /stop, no grace period/SIGTERM-first courtesy — kill means
+    kill. docker run (even -d) calls this defensively to clean up a
+    container it believes failed to start; without this route 404ing
+    unpredictably interacted badly with the CLI's own error handling.
+    """
+    container_id = ctx.params["id"]
+    proc = container_proc.registry.get(container_id)
+    if proc is None:
+        ctx.send_json(404, {"message": f"No such container: {container_id}"})
+        return
+
+    query = _query(ctx)
+    sig_name = query.get("signal", ["KILL"])[0]
+    if not sig_name.startswith("SIG"):
+        sig_name = f"SIG{sig_name}"
+    sig = getattr(signal, sig_name, signal.SIGKILL)
+    container_proc.send_signal(proc, sig)
     ctx.send_empty(204)
 
 
@@ -199,6 +198,7 @@ def remove(ctx: RequestContext) -> None:
         return
     if proc.status == "running":
         container_proc.stop(proc, grace_seconds=5)
+    exec_routes.stop_execs_for(proc.container_id, grace_seconds=5)
 
     uctx = udocker_ctx.get()
     with uctx.lock:
@@ -245,6 +245,17 @@ def logs(ctx: RequestContext) -> None:
 def wait(ctx: RequestContext) -> None:
     """Blocks until the container exits, as `docker run` (not just
     `docker start`) relies on to know when to stop attaching/return.
+
+    The real Docker client's ContainerWait synchronously blocks until it
+    receives *response headers* — separately from reading the body, which
+    it does in a background goroutine — specifically so it can call this
+    before ContainerStart and synchronize on header receipt without
+    waiting for the container to actually exit. If we send headers and
+    body together only once the container exits (send_json's usual
+    behavior), that header-wait blocks forever, since headers never
+    arrive until the thing the client is waiting on already happened —
+    docker run then hangs indefinitely before it ever calls /start.
+    Send headers immediately, then block on the body write instead.
     """
     container_id = ctx.params["id"]
     proc = container_proc.registry.get(container_id)
@@ -252,16 +263,22 @@ def wait(ctx: RequestContext) -> None:
         ctx.send_json(404, {"message": f"No such container: {container_id}"})
         return
 
+    # No Content-Length (body length isn't known yet) and this isn't a
+    # hijack/Upgrade — under HTTP/1.1 that's ambiguous framing unless we
+    # say explicitly that connection-close marks the end of the body.
+    ctx.start_streaming(200, {"Content-Type": "application/json", "Connection": "close"})
+
     with proc.lock:
         proc.lock.wait_for(lambda: proc.status == "exited")
         exit_code = proc.exit_code or 0
-    ctx.send_json(200, {"StatusCode": exit_code})
+    ctx.wfile.write(json.dumps({"StatusCode": exit_code}).encode("utf-8"))
 
 
 def register(router: Router) -> None:
     router.add("POST", r"^/containers/create$", create)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/start$", start)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/stop$", stop)
+    router.add("POST", r"^/containers/(?P<id>[^/]+)/kill$", kill)
     router.add("DELETE", r"^/containers/(?P<id>[^/]+)$", remove)
     router.add("GET", r"^/containers/json$", list_containers)
     router.add("GET", r"^/containers/(?P<id>[^/]+)/json$", inspect)

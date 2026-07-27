@@ -8,6 +8,7 @@ method+path-regex and matched in order.
 import json
 import re
 import socketserver
+import struct
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BufferedIOBase
@@ -17,6 +18,21 @@ import udockerd
 
 RouteHandler = Callable[["RequestContext"], None]
 Route = tuple[str, "re.Pattern[str]", RouteHandler]
+
+STREAM_STDOUT = 1
+STREAM_STDERR = 2
+
+
+def stream_frame(stream_type: int, payload: bytes) -> bytes:
+    """Docker's multiplexed stream framing for non-TTY hijacked
+    connections (exec/attach with Tty: false): an 8-byte header — 1 byte
+    stream type, 3 reserved zero bytes, 4-byte big-endian payload length
+    — followed by the payload. Without this the client's stream demuxer
+    tries to parse raw output bytes as frame headers and fails.
+    TTY-attached sessions skip this entirely (raw passthrough); we don't
+    currently allocate a pty, so this framing is always used.
+    """
+    return struct.pack(">BxxxI", stream_type, len(payload)) + payload
 
 # Docker CLI/SDK prefix requests with a negotiated API version, e.g.
 # "/v1.41/version". Strip it before matching so routes only ever specify
@@ -86,10 +102,40 @@ class RequestContext:
             self._handler.send_header(key, value)
         self._handler.end_headers()
 
+    @property
+    def headers(self) -> Any:
+        return self._handler.headers
+
+    def is_upgrade_request(self) -> bool:
+        """True if the client asked for the raw-stream hijack (docker
+        exec/attach without Detach): Connection: Upgrade + Upgrade: tcp.
+        """
+        return (
+            self._handler.headers.get("Connection", "").lower() == "upgrade"
+            and self._handler.headers.get("Upgrade", "").lower() == "tcp"
+        )
+
+    def start_hijack(self) -> None:
+        """Docker's raw-stream hijack: 101 UPGRADED, then the connection
+        becomes a raw duplex byte stream — no further HTTP framing, read
+        via ctx.rfile / write via ctx.wfile directly. Distinct from
+        start_streaming(), which stays inside normal HTTP response framing
+        (used for non-interactive requests like /containers/{id}/logs).
+        """
+        self._handler.send_response_only(101, "UPGRADED")
+        self._handler.send_header("Content-Type", "application/vnd.docker.raw-stream")
+        self._handler.send_header("Connection", "Upgrade")
+        self._handler.send_header("Upgrade", "tcp")
+        self._handler.end_headers()
+
 
 def make_handler_class(router: Router) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = f"udockerd/{udockerd.__version__}"
+        # Defaults to HTTP/1.0 otherwise, which real Docker's Go HTTP
+        # server never speaks — the docker CLI's client hangs waiting on
+        # exec/attach hijack responses without this.
+        protocol_version = "HTTP/1.1"
 
         def _dispatch(self, method: str) -> None:
             path = self.path.split("?", 1)[0]

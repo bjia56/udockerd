@@ -78,6 +78,14 @@ _EXTRA_OPT_DEFAULTS: dict[str, Any] = {
 
 
 def _apply_default_opt(engine: ExecutionEngineCommon) -> None:
+    # ExecutionEngineCommon.opt is a *class-level* mutable dict (`opt = {}`
+    # on the class body), shared by every engine instance unless replaced.
+    # Without this, engine.opt.update(...) below would mutate that shared
+    # dict, leaking cmd/env/etc from one container's run into every
+    # subsequent one for the lifetime of the daemon process — confirmed
+    # by reproducing exactly that: stale echoed args from earlier test
+    # containers appearing in a later, unrelated container's output.
+    engine.opt = dict(engine.opt)
     for key, default in _EXTRA_OPT_DEFAULTS.items():
         engine.opt.setdefault(key, default)
 
@@ -89,7 +97,7 @@ def _prepend_supervisor(args: Any, supervisor_path: str) -> Any:
     return args
 
 
-def _make_patched_popen(proc: ContainerProc, supervisor_path: str) -> Any:
+def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any) -> Any:
     def _patched_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
         # engine.run() isn't the only thing calling subprocess.Popen/
         # check_output while patched is active — udocker's own internal
@@ -100,12 +108,16 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str) -> Any:
         if not _called_from_engine_run():
             return _original_popen(*args, **kwargs)  # noqa: S603
 
-        # Self-unpatch once we've matched the real launch call: restoring
-        # immediately narrows the window subprocess.Popen is globally
-        # patched to just this one call, so _patch_lock only needs to
-        # guard up to here, not the container's entire (blocking,
-        # possibly long-running) run.
-        subprocess.Popen = _original_popen  # type: ignore[misc]
+        # Self-unpatch AND release _patch_lock once we've matched the
+        # real launch call: engine.run() then blocks for the container's
+        # entire (possibly long) runtime inside subprocess.call().wait().
+        # _patch_lock must not still be held at that point, or every
+        # other container/exec start serializes behind whichever one
+        # happens to be running longest — confirmed exactly that: an
+        # exec into a running container hung indefinitely because the
+        # container's own engine.run() thread still held this lock deep
+        # inside os.waitpid(), long after its own Popen call was done.
+        unpatch()
         args = _prepend_supervisor(args, supervisor_path)
         # No stdout/stderr redirection here would otherwise inherit the
         # daemon's own stdout/stderr. Route container output to its log
@@ -159,9 +171,14 @@ class ContainerRegistry:
         self._containers: dict[str, ContainerProc] = {}
         self._lock = threading.Lock()
 
-    def add(self, proc: ContainerProc) -> None:
+    def add(self, proc: ContainerProc, key: str | None = None) -> None:
+        """key defaults to proc.container_id. Exec instances reuse
+        ContainerProc/spawn() but need a different key (exec_id) than the
+        container_id field, which for them holds the *target* container
+        rather than their own identity.
+        """
         with self._lock:
-            self._containers[proc.container_id] = proc
+            self._containers[key or proc.container_id] = proc
 
     def get(self, id_or_name: str) -> ContainerProc | None:
         """Docker API endpoints accept either the container id or its
@@ -188,15 +205,57 @@ class ContainerRegistry:
 registry = ContainerRegistry()
 
 
+def opt_from_request_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Maps Docker API create/exec request JSON to udocker engine opt
+    fields. Only covers the fields udocker's engines actually read (see
+    _EXTRA_OPT_DEFAULTS above and ExecutionEngineCommon.opt); silently
+    ignores Docker API fields with no proot/fakechroot equivalent (e.g.
+    resource limits) rather than erroring, since there's no meaningful
+    way to honor them here. Shared by routes/containers.py (create) and
+    routes/exec.py (exec create) — both request shapes use the same
+    field names for Cmd/Env/WorkingDir/User.
+    """
+    opt: dict[str, Any] = {}
+    cmd = body.get("Cmd")
+    if cmd:
+        opt["cmd"] = list(cmd)
+    entrypoint = body.get("Entrypoint")
+    if entrypoint:
+        opt["entryp"] = entrypoint if isinstance(entrypoint, str) else " ".join(entrypoint)
+    env = body.get("Env")
+    if env:
+        opt["env"] = list(env)
+    workdir = body.get("WorkingDir")
+    if workdir:
+        opt["cwd"] = workdir
+    user = body.get("User")
+    if user:
+        opt["user"] = user
+    return opt
+
+
 def _run_engine_patched(
     engine: ExecutionEngineCommon, container_id: str, proc: ContainerProc, supervisor_path: str
 ) -> int:
-    with _patch_lock:
-        subprocess.Popen = _make_patched_popen(proc, supervisor_path)  # type: ignore[misc]
-        try:
-            return int(engine.run(container_id))
-        finally:
-            subprocess.Popen = _original_popen  # type: ignore[misc]
+    _patch_lock.acquire()
+    released = False
+
+    def unpatch() -> None:
+        nonlocal released
+        subprocess.Popen = _original_popen  # type: ignore[misc]
+        if not released:
+            released = True
+            _patch_lock.release()
+
+    subprocess.Popen = _make_patched_popen(proc, supervisor_path, unpatch)  # type: ignore[misc]
+    try:
+        return int(engine.run(container_id))
+    finally:
+        # Safety net: if engine.run() never reached the real launch call
+        # (e.g. errored out during setup before Popen), unpatch() above
+        # never ran and the lock is still held — release it here so a
+        # failed start doesn't wedge every other container/exec forever.
+        unpatch()
 
 
 def spawn(proc: ContainerProc) -> None:
@@ -266,6 +325,20 @@ def stop(proc: ContainerProc, grace_seconds: float = 10.0) -> None:
 
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, signal.SIGKILL)
+
+
+def send_signal(proc: ContainerProc, sig: int) -> None:
+    """Direct signal delivery for /containers/{id}/kill, which — unlike
+    /stop — sends exactly the requested signal (SIGKILL by default) with
+    no grace period or SIGTERM-first courtesy.
+    """
+    with proc.lock:
+        pgid = proc.pgid
+        status = proc.status
+    if status != "running" or pgid is None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, sig)
 
 
 def stop_all(grace_seconds: float = 10.0) -> None:

@@ -63,7 +63,14 @@ No root, no namespaces, no cgroups available (Termux), and no ctypes in Cosmopol
 proot has no real network namespace — all containers share the Termux host's network stack (effectively always `--net=host`). API responses report this honestly: empty/host IP in `NetworkSettings`, no fabricated per-container IPs. Avoids lying to clients that actually inspect networking; simple `docker ps/run/logs/exec` flows don't care.
 
 ### HTTP stack
-`http.server.BaseHTTPRequestHandler` + `socketserver.ThreadingMixIn`, stdlib only (required for cosmo bundling — no aiohttp/etc). One thread per connection; long-lived exec/attach/logs streaming connections simply block their own thread, which is fine at expected single-user Termux concurrency levels.
+`http.server.BaseHTTPRequestHandler` + `socketserver.ThreadingMixIn`, stdlib only (required for cosmo bundling — no aiohttp/etc). One thread per connection; long-lived exec/attach/logs streaming connections simply block their own thread, which is fine at expected single-user Termux concurrency levels. `protocol_version = "HTTP/1.1"` is set explicitly — the stdlib default is HTTP/1.0, which the real `docker` CLI's Go HTTP client doesn't speak; without this, exec/attach hijack responses go unrecognized client-side.
+
+### Docker Engine API wire-protocol details that aren't obvious from the docs
+Found by tracing the actual `docker` CLI / `moby` client source (not just the API reference) after hitting silent hangs with no server-side error:
+- **Exec/attach hijack**: non-detached `docker exec`/`attach` send `Connection: Upgrade` + `Upgrade: tcp`; the server must respond `101 UPGRADED` (not a plain `200`) with matching `Connection`/`Upgrade` headers, then the connection becomes a raw duplex byte stream.
+- **Stream multiplexing**: on a non-TTY hijacked connection, output must be framed — 8-byte header (1 byte stream type: 1=stdout/2=stderr, 3 reserved zero bytes, 4-byte big-endian payload length) before each chunk. Raw unframed bytes get misparsed by the client's demuxer as garbage frame headers.
+- **`/containers/{id}/wait` must send response headers before the container exits, not after.** The client's `ContainerWait` is documented (in its own doc comment) to block synchronously until it receives response *headers* — deliberately, so callers can call it before `ContainerStart` to arm the wait first — while it reads the body asynchronously. `docker run` (even `-d`) calls `ContainerWait` before `ContainerStart`. Sending headers+body together only once the container exits (the natural way to write a "block until X" handler) means headers never arrive until the client is already blocked waiting for them — `docker run` hangs indefinitely, before it ever issues `/start`. Fix: send headers immediately (`Connection: close`, since body length isn't known upfront), block on the body write instead.
+- **`/containers/{id}/kill` needs to exist** even though `/stop` covers graceful shutdown — `docker run` calls `kill` defensively as cleanup in some of its own error paths; a 404 there interacts unpredictably with the CLI's error handling.
 
 ## Testing (non-Termux dev host)
 
