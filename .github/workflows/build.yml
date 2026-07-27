@@ -1,0 +1,118 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_multiplatform:
+    name: Build multiplatform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Get Cosmopolitan Python
+        run: |
+          wget https://cosmo.zip/pub/cosmos/bin/python -O python.exe
+          chmod +x python.exe
+
+      - name: Bundle setuptools
+        run: |
+          cp ./python.exe ./python_with_setuptools.exe
+
+          mkdir setuptools_temp
+          ./python.exe -m pip install --target=setuptools_temp setuptools
+
+          folders=$(ls setuptools_temp)
+          for folder in $folders; do
+            ./python.exe scripts/add_to_zip.py ./setuptools_temp/"$folder" ./python_with_setuptools.exe Lib/site-packages/"$folder"
+          done
+
+          rm -rf setuptools_temp
+
+      - name: Install and bundle dependencies
+        run: |
+          # udockerd depends on udocker (see pyproject.toml — pinned exact,
+          # since udockerd reaches into udocker's internal classes, not
+          # just its CLI). --no-deps here only avoids re-wheeling
+          # udockerd's own build-system deps; the install step below pulls
+          # udocker in normally. Both are pure Python (confirmed during
+          # design: no C-extension deps in either package), which is what
+          # makes bundling into a cosmo Python interpreter possible at all
+          # — proot/fakechroot/curl stay external runtime binaries,
+          # fetched by udocker itself on first use, same as on a normal
+          # install.
+          ./python_with_setuptools.exe -m pip wheel --no-deps .
+
+          mkdir udockerd_temp
+          ./python_with_setuptools.exe -m pip install --target=udockerd_temp ./udockerd-*.whl
+
+          folders=$(ls udockerd_temp)
+          for folder in $folders; do
+            ./python_with_setuptools.exe scripts/add_to_zip.py ./udockerd_temp/"$folder" ./python.exe Lib/site-packages/"$folder"
+          done
+
+          zip -urj python.exe scripts/.args
+
+      - name: Rename
+        run: mv python.exe udockerd.exe
+
+      - name: Install upx
+        run: |
+          sudo apt update
+          sudo apt install -y upx-ucl
+
+      - name: Download blink
+        run: |
+          # udockerd only ever runs on Linux (Termux/Android's kernel;
+          # udocker itself needs proot, which doesn't exist on BSD/Solaris/
+          # etc). x86_64/aarch64 are covered natively by the ape-*.elf
+          # interpreters below — blink here only adds the less-common
+          # Linux architectures.
+          mkdir -p /tmp/blink
+          cd /tmp/blink
+
+          for item in \
+            "blink-tiny-linux-powerpc64le-stripped blink-linux-powerpc64le" \
+            "blink-tiny-linux-i386-stripped blink-linux-i386" \
+            "blink-tiny-linux-riscv64-stripped blink-linux-riscv64" \
+            "blink-tiny-linux-loongarch64-stripped blink-linux-loongarch64" \
+            "blink-tiny-linux-s390x-stripped blink-linux-s390x"
+          do
+            set -- $item
+            wget "https://github.com/bjia56/blinkverse/releases/download/v8/$1" -O "$2"
+            chmod +x "$2"
+            if [[ "$2" == "blink-linux-powerpc64le" || "$2" == "blink-linux-i386" ]]; then
+              upx --best "$2"
+            fi
+          done
+
+      - name: Chimplink
+        run: |
+          wget https://github.com/bjia56/chimp/releases/download/v0.12.0/chimplink
+          chmod +x chimplink
+
+          wget https://cosmo.zip/pub/cosmos/bin/ape-aarch64.elf
+          wget https://cosmo.zip/pub/cosmos/bin/ape-x86_64.elf
+
+          sha256=$(sha256sum udockerd.exe | cut -d ' ' -f 1)
+          ./chimplink udockerd.exe udockerd-unknown-unknown ${{ github.sha }} \
+            --sha256 $sha256 \
+            ape-x86_64.elf \
+            ape-aarch64.elf \
+            --os Linux /tmp/blink/blink-linux-*
+          chmod +x udockerd-unknown-unknown
+
+      - name: Verify binary
+        run: |
+          ./udockerd-unknown-unknown --help
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: udockerd-unknown-unknown
+          path: udockerd-unknown-unknown

@@ -1,6 +1,7 @@
 """udockerd startup configuration, including forcing udocker's pure-python HTTP path."""
 
 import os
+import platform
 import shutil
 
 
@@ -22,4 +23,18 @@ def check_curl_available() -> None:
     if shutil.which("curl") is None:
         raise RuntimeError(
             "udockerd requires the 'curl' executable on PATH"
+        )
+
+
+def check_linux() -> None:
+    """udockerd only ever runs on Linux (Termux/Android's kernel; udocker
+    itself needs proot, which doesn't exist on other platforms). The
+    Cosmopolitan build only bundles Linux-architecture blink interpreters
+    (see .github/workflows/build.yml) for the same reason — failing fast
+    here with a clear message beats a confusing failure deep inside
+    udocker/proot on an unsupported platform.
+    """
+    if platform.system() != "Linux":
+        raise RuntimeError(
+            f"udockerd only runs on Linux (detected: {platform.system()})"
         )

@@ -92,10 +92,12 @@ Run udockerd inside a plain (non-privileged, no docker-in-docker) Docker contain
 
 ## Deployment / release
 
-Cosmopolitan libc bundling, following [bodega's build-multiplatform job](https://github.com/bjia56/bodega/blob/main/.github/workflows/build.yml):
-1. Start from Cosmopolitan Python executable (APE, dual x86_64/aarch64).
-2. Install udockerd + udocker (pure-Python only) into a temp dir.
-3. Zip-embed the packages into the cosmo Python executable.
-4. Package entrypoint script in, produce a single portable `udockerd` executable.
+Cosmopolitan libc bundling (`.github/workflows/build.yml`), following [bodega's build-multiplatform job](https://github.com/bjia56/bodega/blob/main/.github/workflows/build.yml):
+1. Start from Cosmopolitan Python executable (APE).
+2. Bundle setuptools into it (needed for the pip install step against the frozen interpreter).
+3. `pip wheel` udockerd, `pip install` it (pulling in udocker as a normal dependency) into a temp dir, zip-embed both into the cosmo Python executable's `Lib/site-packages/`.
+4. Append `scripts/.args` (`-m udockerd`) so the resulting executable runs the daemon by default with no arguments needed.
+5. chimplink for multiplatform APE support — x86_64/aarch64 natively via `ape-*.elf`, plus blink for the less-common Linux architectures (powerpc64le, i386, riscv64, loongarch64, s390x). Unlike bodega, **no non-Linux targets at all** (no per-OS Nuitka matrix, no BSD/Solaris/Haiku blink) — udockerd only ever runs on Linux (Termux/Android's kernel; udocker needs proot, which doesn't exist elsewhere). `udockerd.config.check_linux()` fails fast with a clear error if somehow run on a non-Linux platform, rather than failing confusingly deep inside udocker/proot.
+6. CI verifies the built binary actually runs (`--help`) on a real Linux x86_64 GitHub Actions runner — the one place local WSL testing couldn't validate the cosmo/APE mechanism directly (binfmt_misc conflict), so this is real end-to-end confidence, not just a faithful port of a proven pattern.
 
 Runtime-external, not bundled: `curl`, `proot`/`fakechroot` binaries (udocker downloads these itself on first use, as it already does today), and a C compiler (`cc`/`gcc`/`clang`) for the process supervisor (see above) — cosmo Python has no `ctypes`, so this is compiled on first use rather than embedded.
