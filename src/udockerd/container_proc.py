@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pty
 import signal
 import subprocess
 import sys
@@ -90,11 +91,15 @@ def _apply_default_opt(engine: ExecutionEngineCommon) -> None:
         engine.opt.setdefault(key, default)
 
 
-def _prepend_supervisor(args: Any, supervisor_path: str) -> Any:
+def _prepend_supervisor(args: Any, supervisor_path: str, tty_slave_path: str | None) -> Any:
     cmd = args[0] if args else None
-    if isinstance(cmd, (list, tuple)):
-        return ([supervisor_path, *list(cmd)], *args[1:])
-    return args
+    if not isinstance(cmd, (list, tuple)):
+        return args
+    if tty_slave_path is not None:
+        prefix = [supervisor_path, "tty", tty_slave_path]
+    else:
+        prefix = [supervisor_path, "notty"]
+    return ([*prefix, *list(cmd)], *args[1:])
 
 
 def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any) -> Any:
@@ -118,15 +123,28 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
         # container's own engine.run() thread still held this lock deep
         # inside os.waitpid(), long after its own Popen call was done.
         unpatch()
-        args = _prepend_supervisor(args, supervisor_path)
-        # No stdout/stderr redirection here would otherwise inherit the
-        # daemon's own stdout/stderr. Route container output to its log
-        # file instead.
-        log_fh = open(proc.logfile, "ab")  # noqa: SIM115 - closed via Popen's fd ownership
-        kwargs["stdout"] = log_fh
-        kwargs["stderr"] = log_fh
-        popen_proc = _original_popen(*args, **kwargs)  # noqa: S603
-        log_fh.close()  # Popen dup'd the fd; safe to close our copy
+
+        if proc.tty:
+            master_fd, slave_fd = pty.openpty()
+            proc.pty_master_fd = master_fd
+            tty_slave_path = os.ttyname(slave_fd)
+            os.close(slave_fd)  # supervisor's forked child reopens it after its own setsid
+            args = _prepend_supervisor(args, supervisor_path, tty_slave_path)
+            # No stdin/stdout/stderr kwargs: the pty slave becomes the
+            # container process's controlling terminal via supervisor.c's
+            # own open()+dup2() sequence, not through Popen's redirection.
+            popen_proc = _original_popen(*args, **kwargs)  # noqa: S603
+            spawn_tty_reader(proc, master_fd)
+        else:
+            args = _prepend_supervisor(args, supervisor_path, None)
+            # No stdout/stderr redirection here would otherwise inherit
+            # the daemon's own stdout/stderr. Route container output to
+            # its log file instead.
+            log_fh = open(proc.logfile, "ab")  # noqa: SIM115 - closed via Popen's fd ownership
+            kwargs["stdout"] = log_fh
+            kwargs["stderr"] = log_fh
+            popen_proc = _original_popen(*args, **kwargs)  # noqa: S603
+            log_fh.close()  # Popen dup'd the fd; safe to close our copy
         with proc.lock:
             proc.pid = popen_proc.pid
             # Not os.getpgid(popen_proc.pid): the supervisor calls setsid()
@@ -164,6 +182,17 @@ class ContainerProc:
     # A Condition (not a plain Lock) so /wait can block until status
     # changes via notify_all() instead of polling.
     lock: threading.Condition = field(default_factory=threading.Condition)
+
+    # TTY session state (see spawn_tty_reader below). None for non-TTY
+    # containers/execs, which keep using the plain logfile-tailing path.
+    tty: bool = False
+    pty_master_fd: int | None = None
+    pty_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Live attach/exec clients currently subscribed to this session's pty
+    # output, as (write_callable, on_error_callable) pairs. Populated by
+    # attach/exec-start handlers, drained by the reader thread on write
+    # failure (client disconnected).
+    subscribers: list[Any] = field(default_factory=list)
 
 
 class ContainerRegistry:
@@ -347,6 +376,111 @@ def stop_all(grace_seconds: float = 10.0) -> None:
     """
     for proc in registry.all():
         stop(proc, grace_seconds)
+
+
+def spawn_tty_reader(proc: ContainerProc, master_fd: int) -> None:
+    """One reader thread per TTY session, started right after the pty is
+    allocated. Continuously reads the pty master and fans each chunk out
+    to the logfile (always, so `docker logs` works even after every live
+    client has disconnected) and to any subscribed live attach/exec
+    clients (see subscribe_tty/unsubscribe_tty). A dedicated thread
+    rather than each attach/exec handler reading the master directly,
+    since pty reads are destructive — two readers on the same master
+    would race for bytes instead of both seeing everything.
+    """
+
+    def reader() -> None:
+        with open(proc.logfile, "ab") as logf:
+            while True:
+                try:
+                    chunk = os.read(master_fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                logf.write(chunk)
+                logf.flush()
+                with proc.pty_lock:
+                    dead = []
+                    for write, on_error in proc.subscribers:
+                        try:
+                            write(chunk)
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            dead.append((write, on_error))
+                    for entry in dead:
+                        proc.subscribers.remove(entry)
+                        entry[1]()
+
+    threading.Thread(target=reader, daemon=True).start()
+
+
+def subscribe_tty(proc: ContainerProc, write: Any, on_error: Any) -> None:
+    """Registers a live attach/exec client to receive pty output as it
+    arrives. `on_error` is called once, without arguments, when the
+    subscriber is dropped (write failure = client disconnected) — used to
+    let the caller know its connection should be considered closed.
+    """
+    with proc.pty_lock:
+        proc.subscribers.append((write, on_error))
+
+
+def unsubscribe_tty(proc: ContainerProc, write: Any, on_error: Any) -> None:
+    with proc.pty_lock, contextlib.suppress(ValueError):
+        proc.subscribers.remove((write, on_error))
+
+
+def write_tty_stdin(proc: ContainerProc, data: bytes) -> None:
+    if proc.pty_master_fd is not None:
+        with contextlib.suppress(OSError):
+            os.write(proc.pty_master_fd, data)
+
+
+def stream_session(proc: ContainerProc, out: Any, in_: Any, *, frame: Any) -> None:
+    """Entry point shared by exec start and attach for streaming a live
+    session to a hijacked (or plain-streamed) connection. Dispatches to
+    the TTY path (subscribe to the pty reader thread, forward stdin, raw
+    passthrough — no frame() wrapping, since a real terminal expects raw
+    bytes) or the non-TTY path (tail_log, output-only, multiplex-framed).
+
+    `in_` is the request's rfile for stdin forwarding; pass None to skip
+    stdin handling entirely (e.g. the plain-HTTP-framing fallback path,
+    which real docker clients don't use for interactive input anyway).
+    """
+    if not proc.tty:
+        tail_log(proc, out, follow=True, frame=frame)
+        return
+
+    done = threading.Event()
+
+    def write(chunk: bytes) -> None:
+        out.write(chunk)
+
+    def on_disconnect() -> None:
+        done.set()
+
+    subscribe_tty(proc, write, on_disconnect)
+
+    def forward_stdin() -> None:
+        if in_ is None:
+            return
+        while not done.is_set():
+            try:
+                chunk = in_.read(1)
+            except OSError:
+                break
+            if not chunk:
+                break
+            write_tty_stdin(proc, chunk)
+
+    stdin_thread = threading.Thread(target=forward_stdin, daemon=True)
+    stdin_thread.start()
+
+    try:
+        with proc.lock:
+            proc.lock.wait_for(lambda: proc.status == "exited" or done.is_set())
+    finally:
+        unsubscribe_tty(proc, write, on_disconnect)
+        done.set()
 
 
 def tail_log(proc: ContainerProc, out: Any, *, follow: bool, frame: Any) -> None:

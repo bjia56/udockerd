@@ -45,6 +45,7 @@ def create(ctx: RequestContext) -> None:
         image=proc.image,
         logfile=str(_LOG_DIR / f"{exec_id}.log"),
         opt=container_proc.opt_from_request_body(body),
+        tty=bool(body.get("Tty")),
     )
     _registry.add(exec_proc, key=exec_id)
 
@@ -74,7 +75,8 @@ def start(ctx: RequestContext) -> None:
     # docker exec (non-detached) sends Connection: Upgrade / Upgrade: tcp
     # and expects the 101 hijack response; anything else falls back to a
     # plain streamed response inside normal HTTP framing.
-    if ctx.is_upgrade_request():
+    hijacked = ctx.is_upgrade_request()
+    if hijacked:
         ctx.start_hijack()
     else:
         # Without Connection: close, HTTP/1.1 keep-alive means the client
@@ -86,9 +88,13 @@ def start(ctx: RequestContext) -> None:
         )
 
     # logfile mixes stdout+stderr together (Popen redirects both to the
-    # same fd), so everything is framed as stdout.
-    container_proc.tail_log(
-        exec_proc, ctx.wfile, follow=True, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
+    # same fd), so non-TTY output is framed as stdout. TTY sessions get
+    # raw passthrough and stdin forwarding instead (stream_session).
+    container_proc.stream_session(
+        exec_proc,
+        ctx.wfile,
+        ctx.rfile if hijacked else None,
+        frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk),
     )
 
 

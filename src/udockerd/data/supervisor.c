@@ -28,22 +28,36 @@
  * container command a chance to shut down cleanly in both cases, while
  * still guaranteeing termination if the daemon is gone and nothing else
  * will ever send the follow-up kill. This only catches descendants that
- * stayed in this process's group; a process inside the container that
- * calls setsid() itself would still escape, same residual gap a real
- * init has for that case.
+ * stayed in the relevant process group; a process inside the container
+ * that calls setsid() itself would still escape, same residual gap a
+ * real init has for that case.
+ *
+ * TTY mode: for a pty slave to become the child's controlling terminal,
+ * the child must be a session leader with no ctty at the moment it opens
+ * the slave. This process already called setsid() for itself (for
+ * PDEATHSIG/pgid purposes), so the forked child is a member, not leader,
+ * of that session — it must setsid() again itself before opening the
+ * slave, which necessarily puts it in a *different* session/pgid than
+ * this supervisor (a pgid can't span two sessions). So in TTY mode this
+ * process's crash/shutdown cleanup targets the child's pgid (== child's
+ * pid, once it's called its own setsid) explicitly, in addition to its
+ * own, instead of relying on one shared killpg(0, ...) covering both.
  *
  * Compiled on first use by udockerd (see supervisor.py) since cosmo
  * Python has no ctypes, so PDEATHSIG can't be set in-process via FFI.
  *
- * usage: udockerd_supervisor <command> [args...]
+ * usage: udockerd_supervisor notty <command> [args...]
+ *        udockerd_supervisor tty <pty-slave-path> <command> [args...]
  */
 #define _DEFAULT_SOURCE
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define GRACE_SECONDS 5
@@ -62,9 +76,25 @@ static double monotonic_now(void) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <command> [args...]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s notty <command> [args...]\n", argv[0]);
+        fprintf(stderr, "       %s tty <pty-slave-path> <command> [args...]\n", argv[0]);
         return 2;
+    }
+
+    int is_tty = strcmp(argv[1], "tty") == 0;
+    const char *pty_slave_path = NULL;
+    char **cmd_argv;
+
+    if (is_tty) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: %s tty <pty-slave-path> <command> [args...]\n", argv[0]);
+            return 2;
+        }
+        pty_slave_path = argv[2];
+        cmd_argv = &argv[3];
+    } else {
+        cmd_argv = &argv[2];
     }
 
     if (setsid() < 0) {
@@ -89,9 +119,24 @@ int main(int argc, char *argv[]) {
     }
 
     if (child == 0) {
-        /* Child: exec the real command. It inherits our pgid (no further
-         * setsid here), so a killpg from the supervisor reaches it. */
-        execvp(argv[1], &argv[1]);
+        if (is_tty) {
+            /* New session so this process (about to exec the real
+             * command) has no controlling terminal yet, then opening the
+             * pty slave assigns it as ctty. */
+            setsid();
+            int slave_fd = open(pty_slave_path, O_RDWR);
+            if (slave_fd < 0) {
+                perror("open pty slave");
+                _exit(126);
+            }
+            dup2(slave_fd, 0);
+            dup2(slave_fd, 1);
+            dup2(slave_fd, 2);
+            if (slave_fd > 2) {
+                close(slave_fd);
+            }
+        }
+        execvp(cmd_argv[0], cmd_argv);
         perror("execvp");
         _exit(127);
     }
@@ -122,8 +167,15 @@ int main(int argc, char *argv[]) {
             kill(child, SIGTERM);
         }
         if (terminating && monotonic_now() >= deadline) {
+            if (is_tty) {
+                /* Child is in its own session/pgid (== its pid) in TTY
+                 * mode, not covered by killpg(0, ...) below. Kill it
+                 * first: killpg(0, ...) includes this process itself, so
+                 * nothing after that call would ever run. */
+                killpg(child, SIGKILL);
+            }
             killpg(0, SIGKILL);
-            /* Our own pgid includes us; SIGKILL here ends this loop too. */
+            /* SIGKILL to our own pgid here ends this loop too. */
         }
         usleep(50 * 1000);
     }

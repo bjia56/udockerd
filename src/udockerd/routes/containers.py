@@ -128,6 +128,7 @@ def create(ctx: RequestContext) -> None:
         image=image,
         logfile=str(_LOG_DIR / f"{container_id}.log"),
         opt=container_proc.opt_from_request_body(body),
+        tty=bool(body.get("Tty")),
     )
     container_proc.registry.add(proc)
 
@@ -256,11 +257,11 @@ def logs(ctx: RequestContext) -> None:
 
 
 def attach(ctx: RequestContext) -> None:
-    """Streams the running container's output live. Since proot has no
-    real process to "attach" a live pty/pipe to after the fact (stdout is
-    already being redirected to the logfile from spawn time), this is the
-    same live-tail-until-exit as /logs?follow, wrapped in the hijack
-    handshake instead of plain HTTP framing when the client requests it.
+    """Streams the running container's output live. For TTY containers,
+    joins the live pty session (raw passthrough, stdin forwarded) via
+    stream_session; otherwise the same live-tail-until-exit as
+    /logs?follow, wrapped in the hijack handshake instead of plain HTTP
+    framing when the client requests it.
     """
     container_id = ctx.params["id"]
     proc = container_proc.registry.get(container_id)
@@ -268,7 +269,8 @@ def attach(ctx: RequestContext) -> None:
         ctx.send_json(404, {"message": f"No such container: {container_id}"})
         return
 
-    if ctx.is_upgrade_request():
+    hijacked = ctx.is_upgrade_request()
+    if hijacked:
         ctx.start_hijack()
     else:
         # Same Connection: close reasoning as /logs above.
@@ -276,8 +278,11 @@ def attach(ctx: RequestContext) -> None:
             200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
         )
 
-    container_proc.tail_log(
-        proc, ctx.wfile, follow=True, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
+    container_proc.stream_session(
+        proc,
+        ctx.wfile,
+        ctx.rfile if hijacked else None,
+        frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk),
     )
 
 
