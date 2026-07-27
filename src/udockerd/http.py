@@ -127,6 +127,15 @@ class RequestContext:
         self._handler.send_header("Connection", "Upgrade")
         self._handler.send_header("Upgrade", "tcp")
         self._handler.end_headers()
+        # Once the hijack handler returns, BaseHTTPRequestHandler's
+        # handle() loop would otherwise try to parse a *next* HTTP
+        # request off the now-raw socket — the client is done writing
+        # and expects the connection to close, but the server keeps it
+        # open waiting for a request line that will never come. Docker
+        # clients that read the exec/attach output non-streamed (e.g.
+        # exec_run's default blocking mode) read until EOF and hang
+        # forever without this.
+        self._handler.close_connection = True
 
 
 def make_handler_class(router: Router) -> type[BaseHTTPRequestHandler]:

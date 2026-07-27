@@ -9,6 +9,11 @@ RUN apt-get update && \
 
 RUN useradd -m udocker
 USER udocker
+# RUN doesn't set $HOME the way an interactive login shell does — without
+# this, pip's build isolation for `pip install --user` (and udocker's own
+# Path.home()-based config/repo lookups at runtime) resolve to the wrong
+# location and fail with permission errors.
+ENV HOME=/home/udocker
 WORKDIR /home/udocker/app
 
 COPY --chown=udocker:udocker pyproject.toml /home/udocker/app/pyproject.toml

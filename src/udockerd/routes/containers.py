@@ -87,6 +87,15 @@ def _inspect_json(proc: ContainerProc) -> dict[str, Any]:
         },
         "Config": {
             "Image": proc.image,
+            "Tty": proc.tty,
+            "Cmd": proc.opt.get("cmd", []),
+            "Env": proc.opt.get("env", []),
+            "WorkingDir": proc.opt.get("cwd", ""),
+            "User": proc.opt.get("user", ""),
+            "AttachStdin": False,
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "OpenStdin": proc.tty,
         },
         "NetworkSettings": _network_settings(),
     }

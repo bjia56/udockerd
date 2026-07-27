@@ -75,6 +75,28 @@ def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
     return None
 
 
+def _resolve_by_name_or_id(name: str) -> tuple[str, str] | None:
+    """Resolves a name (repo:tag / short name, via _resolve_imagerepo) or
+    a bare sha256:... digest id to the underlying (imagerepo, tag).
+
+    `docker images` reports each image's own digest as its Id, and
+    `client.images.list()` in the Python SDK follows up by calling
+    inspect on every one of those ids directly (not by repo:tag) — so
+    /images/{name}/json has to accept both forms, the same as real
+    Docker does.
+    """
+    if name.startswith("sha256:"):
+        uctx = udocker_ctx.get()
+        for imagerepo, tag in uctx.local.get_imagerepos():
+            info = _manifest_info(imagerepo, tag)
+            candidate_id = info["id"] if info else _synthetic_id(imagerepo, tag)
+            if candidate_id == name:
+                return imagerepo, tag
+        return None
+    imagerepo, tag = _split_imagespec(name)
+    return _resolve_imagerepo(imagerepo, tag)
+
+
 def _created_timestamp(image_json: dict[str, Any] | None) -> int:
     """Real Docker config JSON has a "created" RFC3339 string; convert to
     the unix timestamp /images/json reports. Falls back to 0 (epoch) when
@@ -125,7 +147,13 @@ def create(ctx: RequestContext) -> None:
         return
 
     uctx = udocker_ctx.get()
-    ctx.start_streaming(200, {"Content-Type": "application/json"})
+    # No Content-Length (unknown up front) and not a hijack/Upgrade —
+    # under HTTP/1.1 that's ambiguous framing unless Connection: close
+    # says explicitly that connection-close marks the end of the body.
+    # Same class of bug as /wait, /logs, /attach: curl doesn't care about
+    # clean stream termination and masked this in manual testing: the
+    # docker SDK's stricter client does, and hung waiting for it.
+    ctx.start_streaming(200, {"Content-Type": "application/json", "Connection": "close"})
     with uctx.lock:
         files = uctx.dockerioapi.get(from_image, tag)
     status = "Download complete" if files else "Error pulling image"
@@ -146,10 +174,9 @@ def list_images(ctx: RequestContext) -> None:
 
 def inspect(ctx: RequestContext) -> None:
     name = ctx.params["name"]
-    imagerepo, tag = _split_imagespec(name)
     uctx = udocker_ctx.get()
     with uctx.lock:
-        resolved = _resolve_imagerepo(imagerepo, tag)
+        resolved = _resolve_by_name_or_id(name)
         if resolved is None:
             ctx.send_json(404, {"message": f"No such image: {name}"})
             return
@@ -188,10 +215,9 @@ def inspect(ctx: RequestContext) -> None:
 
 def remove(ctx: RequestContext) -> None:
     name = ctx.params["name"]
-    imagerepo, tag = _split_imagespec(name)
     uctx = udocker_ctx.get()
     with uctx.lock:
-        resolved = _resolve_imagerepo(imagerepo, tag)
+        resolved = _resolve_by_name_or_id(name)
         if resolved is None:
             ctx.send_json(404, {"message": f"No such image: {name}"})
             return
