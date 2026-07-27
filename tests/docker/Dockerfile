@@ -1,6 +1,4 @@
-# Test harness image: runs udockerd unprivileged, same shape as the real
-# Termux deployment (no host docker socket, no privileged mode, no
-# extra capabilities). udocker itself runs entirely as a non-root user.
+# Test harness: runs udockerd unprivileged, same shape as the real Termux deployment.
 FROM python:3.12-slim
 
 RUN apt-get update && \
@@ -9,10 +7,7 @@ RUN apt-get update && \
 
 RUN useradd -m udocker
 USER udocker
-# RUN doesn't set $HOME the way an interactive login shell does — without
-# this, pip's build isolation for `pip install --user` (and udocker's own
-# Path.home()-based config/repo lookups at runtime) resolve to the wrong
-# location and fail with permission errors.
+# RUN doesn't set $HOME like a login shell; needed for pip --user and udocker's Path.home() lookups.
 ENV HOME=/home/udocker
 WORKDIR /home/udocker/app
 

@@ -1,14 +1,12 @@
 """Shared test-harness fixture: builds the udockerd test-harness image
-once per test session and runs it as an unprivileged Docker container,
-the same shape as the real Termux deployment. Tests drive it with the
-real docker CLI/SDK over DOCKER_HOST, not a hand-rolled client.
+once per session, runs it as an unprivileged container (same shape as
+the real Termux deployment). Tests drive it via DOCKER_HOST with the
+real docker CLI/SDK.
 
-Harness build/run uses the docker CLI directly (subprocess), not the
-docker SDK's images.build() — the SDK's build path (classic builder API)
-handles USER/WORKDIR permissions differently than `docker build` (which
-defaults to BuildKit) and produced a spurious permission error building
-udockerd's own wheel that never happens via the CLI or in the real
-deployment target (no docker daemon/BuildKit involved there at all).
+Harness build/run uses the docker CLI directly, not the SDK's
+images.build() — the SDK's classic-builder path handles USER/WORKDIR
+permissions differently than BuildKit and produced a spurious
+permission error building udockerd's own wheel.
 """
 
 import shutil
@@ -34,9 +32,7 @@ def docker_available() -> bool:
 @pytest.fixture(scope="session")
 def harness_port():
     """Yields the host port udockerd is listening on inside the harness
-    container. Session-scoped: one build, one running daemon, reused by
-    every test — individual tests are responsible for cleaning up any
-    containers/images they create against it.
+    container. Session-scoped; tests clean up their own containers/images.
     """
     if not docker_available():
         pytest.skip("docker daemon not available")
@@ -62,8 +58,7 @@ def harness_port():
     )
     try:
         # udocker's own tool install (proot/fakechroot download) on first
-        # boot inside the harness can take a while; give it real headroom
-        # rather than a tight HTTP-only readiness check.
+        # boot can take a while.
         deadline = time.time() + 60
         while time.time() < deadline:
             result = subprocess.run(

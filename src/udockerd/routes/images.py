@@ -17,14 +17,9 @@ if TYPE_CHECKING:
 
 
 def _manifest_info(imagerepo: str, tag: str) -> dict[str, Any]:
-    """Read the real registry manifest udocker already stored on pull
-    (local/latest/manifest, saved verbatim by DockerIoAPI) to get the
-    actual config digest and layer digests — the same values the real
-    Docker daemon would report — instead of fabricating an id.
-
-    v1-schema manifests (older Docker Hub images, no longer the common
-    case) don't carry a config digest at all; callers get an empty dict
-    back and should fall back to a clearly-synthetic id.
+    """Reads the real stored registry manifest for actual config/layer
+    digests instead of fabricating an id. v1-schema manifests carry no
+    config digest; callers fall back to _synthetic_id.
     """
     uctx = udocker_ctx.get()
     if not uctx.local.cd_imagerepo(imagerepo, tag):
@@ -39,10 +34,7 @@ def _manifest_info(imagerepo: str, tag: str) -> dict[str, Any]:
 
 
 def _synthetic_id(imagerepo: str, tag: str) -> str:
-    """Fallback id for manifests with no real config digest (v1 schema).
-    Distinct from the repo:tag string so `docker images`, which reads Id
-    for the IMAGE ID column, doesn't display the tag there instead.
-    """
+    """Fallback id for manifests with no real config digest (v1 schema)."""
     digest = hashlib.sha256(f"{imagerepo}:{tag}".encode()).hexdigest()
     return f"sha256:{digest}"
 
@@ -58,11 +50,9 @@ def _split_imagespec(imagespec: str) -> tuple[str, str]:
 
 
 def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
-    """Images pulled via DockerIoAPI.get() end up stored under a qualified
-    path (e.g. docker.io/library/alpine), but clients commonly ask for the
-    short name (alpine) — same as the real Docker daemon accepts both.
-    Reuses DockerIoAPI's own name-qualification logic rather than
-    reimplementing Docker Hub's namespacing rules.
+    """Images are stored under a qualified path (docker.io/library/alpine)
+    but clients ask for the short name; reuses DockerIoAPI's own
+    name-qualification logic.
     """
     uctx = udocker_ctx.get()
     if uctx.local.cd_imagerepo(imagerepo, tag):
@@ -76,14 +66,8 @@ def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
 
 
 def _resolve_by_name_or_id(name: str) -> tuple[str, str] | None:
-    """Resolves a name (repo:tag / short name, via _resolve_imagerepo) or
-    a bare sha256:... digest id to the underlying (imagerepo, tag).
-
-    `docker images` reports each image's own digest as its Id, and
-    `client.images.list()` in the Python SDK follows up by calling
-    inspect on every one of those ids directly (not by repo:tag) — so
-    /images/{name}/json has to accept both forms, the same as real
-    Docker does.
+    """Resolves a repo:tag/short name or a bare sha256:... digest id.
+    Needed since client.images.list() inspects by digest id, not name.
     """
     if name.startswith("sha256:"):
         uctx = udocker_ctx.get()
@@ -98,9 +82,8 @@ def _resolve_by_name_or_id(name: str) -> tuple[str, str] | None:
 
 
 def _created_timestamp(image_json: dict[str, Any] | None) -> int:
-    """Real Docker config JSON has a "created" RFC3339 string; convert to
-    the unix timestamp /images/json reports. Falls back to 0 (epoch) when
-    unavailable rather than fabricating a value.
+    """Converts config JSON's RFC3339 "created" string to unix timestamp;
+    falls back to 0 rather than fabricating a value.
     """
     created = (image_json or {}).get("created")
     if not created:
@@ -134,10 +117,8 @@ def _image_summary(imagerepo: str, tag: str) -> dict[str, Any]:
 
 def create(ctx: RequestContext) -> None:
     """POST /images/create?fromImage=<repo>&tag=<tag> — pull an image.
-
-    Docker API streams progress as newline-delimited JSON; we emit a
-    minimal status/error stream rather than faked per-layer progress,
-    since udocker's DockerIoAPI.get() doesn't expose per-layer callbacks.
+    Emits a minimal status/error stream (no per-layer progress; udocker's
+    DockerIoAPI.get() exposes no per-layer callbacks).
     """
     query = parse_qs(urlsplit(ctx.path).query)
     from_image = query.get("fromImage", [""])[0]
@@ -147,12 +128,6 @@ def create(ctx: RequestContext) -> None:
         return
 
     uctx = udocker_ctx.get()
-    # No Content-Length (unknown up front) and not a hijack/Upgrade —
-    # under HTTP/1.1 that's ambiguous framing unless Connection: close
-    # says explicitly that connection-close marks the end of the body.
-    # Same class of bug as /wait, /logs, /attach: curl doesn't care about
-    # clean stream termination and masked this in manual testing: the
-    # docker SDK's stricter client does, and hung waiting for it.
     ctx.start_streaming(200, {"Content-Type": "application/json", "Connection": "close"})
     with uctx.lock:
         files = uctx.dockerioapi.get(from_image, tag)

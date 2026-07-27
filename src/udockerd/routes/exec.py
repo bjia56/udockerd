@@ -23,10 +23,8 @@ if TYPE_CHECKING:
 
 _LOG_DIR = Path.home() / ".udockerd" / "logs" / "exec"
 
-# Separate registry, keyed by exec_id rather than container_id — Docker
-# API treats exec instances as their own object space distinct from
-# containers, even though under the hood they reuse the same
-# spawn/patch/supervisor machinery as container_proc.spawn().
+# Keyed by exec_id, distinct object space from containers per Docker API,
+# though it reuses container_proc.spawn()'s machinery underneath.
 _registry = container_proc.ContainerRegistry()
 
 
@@ -72,24 +70,14 @@ def start(ctx: RequestContext) -> None:
         ctx.send_empty(200)
         return
 
-    # docker exec (non-detached) sends Connection: Upgrade / Upgrade: tcp
-    # and expects the 101 hijack response; anything else falls back to a
-    # plain streamed response inside normal HTTP framing.
     hijacked = ctx.is_upgrade_request()
     if hijacked:
         ctx.start_hijack()
     else:
-        # Without Connection: close, HTTP/1.1 keep-alive means the client
-        # waits for connection close as end-of-stream while the server
-        # tries to keep it open for a next request — neither side ever
-        # terminates. Same issue as /wait and /logs.
         ctx.start_streaming(
             200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
         )
 
-    # logfile mixes stdout+stderr together (Popen redirects both to the
-    # same fd), so non-TTY output is framed as stdout. TTY sessions get
-    # raw passthrough and stdin forwarding instead (stream_session).
     container_proc.stream_session(
         exec_proc,
         ctx.wfile,
@@ -116,11 +104,7 @@ def inspect(ctx: RequestContext) -> None:
 
 
 def stop_execs_for(container_id: str, grace_seconds: float = 5.0) -> None:
-    """Called when a container is stopped/removed so its exec instances
-    (independent proot invocations against the same ROOT, per the module
-    docstring) don't keep running as orphans once the container they were
-    attached to is gone.
-    """
+    """Stops orphaned exec instances when their container is stopped/removed."""
     for exec_proc in _registry.all():
         if exec_proc.container_id != container_id:
             continue

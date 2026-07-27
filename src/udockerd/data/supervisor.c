@@ -1,50 +1,25 @@
-/* Tiny process supervisor: runs a command in its own process group and
- * guarantees the whole group is killed if udockerd itself dies, even via
- * SIGKILL/crash/OOM, when a plain PR_SET_PDEATHSIG on the command itself
- * wouldn't be enough.
+/* Tiny process supervisor: guarantees the container command's whole
+ * process group dies if udockerd dies (crash/SIGKILL/OOM included).
  *
- * Why fork() instead of a plain exec wrapper: PDEATHSIG only fires on the
- * exact process that set it. udocker's proot engine forks its own traced
- * child to run the actual container command — that fork does not inherit
- * an active PDEATHSIG watch, so if this process just exec'd proot
- * directly, proot itself would die correctly when udockerd dies, but
- * proot's child (the real container command) would be orphaned to init
- * and keep running. Since SIGKILL never runs cleanup code in the dying
- * process, proot's own --kill-on-exit handler can't save us either.
+ * Forks instead of exec'ing the command directly: PDEATHSIG only fires
+ * on the exact process that set it, and proot forks its own traced child
+ * to run the actual container command — that grandchild wouldn't inherit
+ * our PDEATHSIG watch. So this process stays alive as a tiny init: sets
+ * its own PDEATHSIG to SIGTERM, forks the real command, and waits on it.
  *
- * So instead this process forks: the child execs the real command (proot
- * ...), and this process stays alive as a tiny init for that subtree —
- * it sets its own PDEATHSIG to SIGTERM (catchable, unlike SIGKILL) so it
- * gets a chance to run cleanup, and waits on its child (reaping zombies
- * from anything double-forked underneath, same as a real init would).
+ * SIGTERM here can mean either udockerd's own graceful-stop (more signals
+ * may follow) or PDEATHSIG firing because udockerd died (nothing else is
+ * coming) — can't tell which, so we run our own grace period regardless:
+ * forward SIGTERM to the child, wait, then killpg SIGKILL.
  *
- * SIGTERM here means one of two things: udockerd sent it directly as
- * part of its own graceful-stop path (daemon still alive, will follow up
- * with SIGKILL after its own grace period if needed), or PDEATHSIG fired
- * because udockerd died (daemon gone, no follow-up signal is coming from
- * anywhere). Either way this process can't tell which case it's in, so
- * it manages a short grace period itself: forward SIGTERM to the child,
- * wait, then killpg SIGKILL if it hasn't exited — giving the real
- * container command a chance to shut down cleanly in both cases, while
- * still guaranteeing termination if the daemon is gone and nothing else
- * will ever send the follow-up kill. This only catches descendants that
- * stayed in the relevant process group; a process inside the container
- * that calls setsid() itself would still escape, same residual gap a
- * real init has for that case.
+ * TTY mode: the child must be its own session leader with no ctty when it
+ * opens the pty slave, so it setsid()s again, landing in a *different*
+ * pgid than this supervisor. Cleanup must therefore killpg the child's
+ * pgid explicitly (before killpg(0, ...), which would otherwise kill us
+ * first and skip that second call).
  *
- * TTY mode: for a pty slave to become the child's controlling terminal,
- * the child must be a session leader with no ctty at the moment it opens
- * the slave. This process already called setsid() for itself (for
- * PDEATHSIG/pgid purposes), so the forked child is a member, not leader,
- * of that session — it must setsid() again itself before opening the
- * slave, which necessarily puts it in a *different* session/pgid than
- * this supervisor (a pgid can't span two sessions). So in TTY mode this
- * process's crash/shutdown cleanup targets the child's pgid (== child's
- * pid, once it's called its own setsid) explicitly, in addition to its
- * own, instead of relying on one shared killpg(0, ...) covering both.
- *
- * Compiled on first use by udockerd (see supervisor.py) since cosmo
- * Python has no ctypes, so PDEATHSIG can't be set in-process via FFI.
+ * Compiled on first use by udockerd (see supervisor.py) — cosmo Python
+ * has no ctypes, so PDEATHSIG can't be set in-process.
  *
  * usage: udockerd_supervisor notty <command> [args...]
  *        udockerd_supervisor tty <pty-slave-path> <command> [args...]
@@ -120,9 +95,7 @@ int main(int argc, char *argv[]) {
 
     if (child == 0) {
         if (is_tty) {
-            /* New session so this process (about to exec the real
-             * command) has no controlling terminal yet, then opening the
-             * pty slave assigns it as ctty. */
+            /* New session, no ctty yet; opening the pty slave assigns it. */
             setsid();
             int slave_fd = open(pty_slave_path, O_RDWR);
             if (slave_fd < 0) {
@@ -141,15 +114,8 @@ int main(int argc, char *argv[]) {
         _exit(127);
     }
 
-    /* Parent: supervise. Loop on waitpid so we reap the direct child
-     * (and, if it double-forks without its own setsid, other
-     * descendants) while watching for our own termination signal.
-     *
-     * SIGTERM (from udockerd's graceful stop, or PDEATHSIG firing because
-     * udockerd died) forwards SIGTERM to the child and starts a grace
-     * period timer here — this process manages the escalation itself
-     * since it can't tell whether a live udockerd will still send a
-     * follow-up SIGKILL or whether it's already gone. */
+    /* Parent: reap child, watch for our own termination signal, escalate
+     * SIGTERM -> grace period -> SIGKILL. */
     int status = 0;
     int terminating = 0;
     double deadline = 0;
@@ -168,14 +134,11 @@ int main(int argc, char *argv[]) {
         }
         if (terminating && monotonic_now() >= deadline) {
             if (is_tty) {
-                /* Child is in its own session/pgid (== its pid) in TTY
-                 * mode, not covered by killpg(0, ...) below. Kill it
-                 * first: killpg(0, ...) includes this process itself, so
-                 * nothing after that call would ever run. */
+                /* Child has its own pgid in TTY mode; kill it before our
+                 * own pgid below, since that call kills us too. */
                 killpg(child, SIGKILL);
             }
             killpg(0, SIGKILL);
-            /* SIGKILL to our own pgid here ends this loop too. */
         }
         usleep(50 * 1000);
     }

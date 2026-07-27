@@ -36,16 +36,9 @@ jobs:
 
       - name: Install and bundle dependencies
         run: |
-          # udockerd depends on udocker (see pyproject.toml — pinned exact,
-          # since udockerd reaches into udocker's internal classes, not
-          # just its CLI). --no-deps here only avoids re-wheeling
-          # udockerd's own build-system deps; the install step below pulls
-          # udocker in normally. Both are pure Python (confirmed during
-          # design: no C-extension deps in either package), which is what
-          # makes bundling into a cosmo Python interpreter possible at all
-          # — proot/fakechroot/curl stay external runtime binaries,
-          # fetched by udocker itself on first use, same as on a normal
-          # install.
+          # udocker (pulled in normally below) and udockerd are both pure
+          # Python, which is what makes bundling into cosmo Python
+          # possible; proot/fakechroot/curl stay external runtime binaries.
           ./python_with_setuptools.exe -m pip wheel --no-deps .
 
           mkdir udockerd_temp
@@ -68,11 +61,8 @@ jobs:
 
       - name: Download blink
         run: |
-          # udockerd only ever runs on Linux (Termux/Android's kernel;
-          # udocker itself needs proot, which doesn't exist on BSD/Solaris/
-          # etc). x86_64/aarch64 are covered natively by the ape-*.elf
-          # interpreters below — blink here only adds the less-common
-          # Linux architectures.
+          # x86_64/aarch64 run natively via ape-*.elf below; blink covers
+          # the less-common Linux-only architectures (proot has no BSD/etc target).
           mkdir -p /tmp/blink
           cd /tmp/blink
 

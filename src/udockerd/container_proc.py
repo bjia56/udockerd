@@ -1,27 +1,10 @@
 """Spawns and tracks container processes via udocker's execution engines.
 
-udocker's engine.run() (PRootEngine, FakechrootEngine, ...) builds its
-command list from self.opt and calls subprocess.call(cmd_l, ...) directly,
-synchronously, with no exposed Popen object and no factored-out "build
-command" step. There's no non-invasive way to get the child pid/pgid or
-otherwise hook the actual exec through the public API.
-
-Rather than reimplement command construction (fragile, duplicates a lot of
-udocker's real per-mode logic: uid mapping, volume bindings, qemu, network
-maps, kernel emulation), we monkeypatch subprocess.Popen for the scope of
-the engine.run() call only, to capture the resulting Popen object (for
-pid/pgid) and prepend our process supervisor (see supervisor.py/.c) to the
-command being run. This is coupled to udocker calling subprocess.call/
-Popen in engine.run(); udockerd already pins udocker to an exact version
-for the same class of internal-API coupling (see udocker_ctx.py,
-routes/images.py).
-
-Cosmopolitan Python has no ctypes (_ctypes isn't compiled in), so
-PR_SET_PDEATHSIG can't be set in-process via a preexec_fn. The supervisor
-is a tiny compiled C program that forks, sets PDEATHSIG, and stays alive
-to reap/clean up its subtree — see supervisor.c for why a plain exec
-wrapper isn't enough (proot forks its own traced child, which doesn't
-inherit a PDEATHSIG watch).
+engine.run() (PRootEngine, FakechrootEngine, ...) calls subprocess
+directly with no exposed Popen object, so we monkeypatch subprocess.Popen
+for the scope of that call to capture pid/pgid and prepend our process
+supervisor (supervisor.py/.c, needed since Cosmopolitan Python has no
+ctypes for PR_SET_PDEATHSIG).
 """
 
 from __future__ import annotations
@@ -47,31 +30,21 @@ if TYPE_CHECKING:
 _patch_lock = threading.Lock()
 _original_popen = subprocess.Popen
 
-# The real container-launch call happens directly inside these engines'
-# run() methods (PRootEngine.run, FakechrootEngine.run). udocker's own
-# internal helpers (e.g. HostInfo.cmd_has_option probing proot's
-# --kill-on-exit support) also call subprocess.Popen/check_output during
-# run(), before the real launch — checking the immediate caller frame
-# tells them apart directly, rather than relying on an incidental kwarg
-# (e.g. close_fds) that happens to differ today but isn't a documented
-# distinction udocker guarantees to keep.
+# udocker's own internal helpers (e.g. HostInfo.cmd_has_option) also call
+# subprocess.Popen during run(), before the real launch, so we check the
+# caller frame to only intercept the actual container-launch call.
 _ENGINE_RUN_FILENAMES = ("engine/proot.py", "engine/fakechroot.py")
 
 
 def _called_from_engine_run() -> bool:
-    # Depth from here: 0=this function, 1=_patched_popen (our caller),
-    # 2=subprocess.call (Popen's direct caller, "with Popen(...)"),
-    # 3=engine.run (the frame we actually want to identify).
+    # 0=here, 1=_patched_popen, 2=subprocess.call, 3=engine.run
     frame = sys._getframe(3)
     filename = frame.f_code.co_filename.replace("\\", "/")
     return frame.f_code.co_name == "run" and filename.endswith(_ENGINE_RUN_FILENAMES)
 
-# engine.run() reads these opt keys directly but they're only ever
-# populated by udocker's own cmdp/CLI-argument parsing (_get_run_options in
-# cli.py), which we bypass entirely to drive the engine programmatically.
-# Values match what an unset CLI flag would default to. If a future
-# (pinned) udocker version's run() reads additional opt keys not covered
-# by ExecutionEngineCommon's class-level defaults, they'll need adding here.
+# engine.run() reads these opt keys but they're normally populated by
+# udocker's own CLI-argument parsing, which we bypass. Values match the
+# unset-CLI-flag defaults.
 _EXTRA_OPT_DEFAULTS: dict[str, Any] = {
     "kernel": "",
     "netcoop": False,
@@ -79,13 +52,9 @@ _EXTRA_OPT_DEFAULTS: dict[str, Any] = {
 
 
 def _apply_default_opt(engine: ExecutionEngineCommon) -> None:
-    # ExecutionEngineCommon.opt is a *class-level* mutable dict (`opt = {}`
-    # on the class body), shared by every engine instance unless replaced.
-    # Without this, engine.opt.update(...) below would mutate that shared
-    # dict, leaking cmd/env/etc from one container's run into every
-    # subsequent one for the lifetime of the daemon process — confirmed
-    # by reproducing exactly that: stale echoed args from earlier test
-    # containers appearing in a later, unrelated container's output.
+    # ExecutionEngineCommon.opt is a class-level mutable dict shared by
+    # every engine instance; copy before mutating or state leaks across
+    # unrelated containers.
     engine.opt = dict(engine.opt)
     for key, default in _EXTRA_OPT_DEFAULTS.items():
         engine.opt.setdefault(key, default)
@@ -104,24 +73,13 @@ def _prepend_supervisor(args: Any, supervisor_path: str, tty_slave_path: str | N
 
 def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any) -> Any:
     def _patched_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        # engine.run() isn't the only thing calling subprocess.Popen/
-        # check_output while patched is active — udocker's own internal
-        # helpers (e.g. HostInfo.cmd_has_option, probing for proot's
-        # --kill-on-exit support) also shell out during run(), before the
-        # real container launch. Only intercept the call that's actually
-        # coming from inside the engine's run() method.
         if not _called_from_engine_run():
             return _original_popen(*args, **kwargs)  # noqa: S603
 
-        # Self-unpatch AND release _patch_lock once we've matched the
-        # real launch call: engine.run() then blocks for the container's
-        # entire (possibly long) runtime inside subprocess.call().wait().
-        # _patch_lock must not still be held at that point, or every
-        # other container/exec start serializes behind whichever one
-        # happens to be running longest — confirmed exactly that: an
-        # exec into a running container hung indefinitely because the
-        # container's own engine.run() thread still held this lock deep
-        # inside os.waitpid(), long after its own Popen call was done.
+        # Release the lock (and unpatch) now: engine.run() is about to
+        # block for the container's entire runtime inside Popen().wait(),
+        # and holding the lock that long would serialize every other
+        # container/exec start behind whichever one runs longest.
         unpatch()
 
         if proc.tty:
@@ -130,16 +88,12 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
             tty_slave_path = os.ttyname(slave_fd)
             os.close(slave_fd)  # supervisor's forked child reopens it after its own setsid
             args = _prepend_supervisor(args, supervisor_path, tty_slave_path)
-            # No stdin/stdout/stderr kwargs: the pty slave becomes the
-            # container process's controlling terminal via supervisor.c's
-            # own open()+dup2() sequence, not through Popen's redirection.
+            # No stdin/stdout/stderr kwargs: supervisor.c's own dup2()
+            # sequence makes the pty slave the controlling terminal.
             popen_proc = _original_popen(*args, **kwargs)  # noqa: S603
             spawn_tty_reader(proc, master_fd)
         else:
             args = _prepend_supervisor(args, supervisor_path, None)
-            # No stdout/stderr redirection here would otherwise inherit
-            # the daemon's own stdout/stderr. Route container output to
-            # its log file instead.
             log_fh = open(proc.logfile, "ab")  # noqa: SIM115 - closed via Popen's fd ownership
             kwargs["stdout"] = log_fh
             kwargs["stderr"] = log_fh
@@ -147,14 +101,8 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
             log_fh.close()  # Popen dup'd the fd; safe to close our copy
         with proc.lock:
             proc.pid = popen_proc.pid
-            # Not os.getpgid(popen_proc.pid): the supervisor calls setsid()
-            # (pgid := its own pid) right after start but before it forks
-            # the real command, and reading the pgid via a syscall
-            # immediately after Popen() returns races that — it can
-            # observe the pre-setsid value. setsid() guarantees
-            # pgid == pid once it runs, and that pid is exactly
-            # popen_proc.pid, so this is correct without waiting on the
-            # race.
+            # Not os.getpgid(): supervisor's setsid() races a fresh
+            # syscall read, but pgid == its own pid == popen_proc.pid.
             proc.pgid = popen_proc.pid
             proc.status = "running"
             proc.started_at = time.time()
@@ -176,22 +124,17 @@ class ContainerProc:
     logfile: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
-    # engine.opt overrides captured at /containers/create time (cmd, env,
-    # user, cwd, ...) and applied when /start actually spawns the process.
+    # engine.opt overrides captured at /containers/create time, applied
+    # when /start spawns the process.
     opt: dict[str, Any] = field(default_factory=dict)
-    # A Condition (not a plain Lock) so /wait can block until status
-    # changes via notify_all() instead of polling.
+    # Condition, not Lock: /wait blocks on notify_all() instead of polling.
     lock: threading.Condition = field(default_factory=threading.Condition)
 
-    # TTY session state (see spawn_tty_reader below). None for non-TTY
-    # containers/execs, which keep using the plain logfile-tailing path.
     tty: bool = False
     pty_master_fd: int | None = None
     pty_lock: threading.Lock = field(default_factory=threading.Lock)
-    # Live attach/exec clients currently subscribed to this session's pty
-    # output, as (write_callable, on_error_callable) pairs. Populated by
-    # attach/exec-start handlers, drained by the reader thread on write
-    # failure (client disconnected).
+    # Live attach/exec clients subscribed to this session's pty output, as
+    # (write_callable, on_error_callable) pairs.
     subscribers: list[Any] = field(default_factory=list)
 
 
@@ -201,18 +144,14 @@ class ContainerRegistry:
         self._lock = threading.Lock()
 
     def add(self, proc: ContainerProc, key: str | None = None) -> None:
-        """key defaults to proc.container_id. Exec instances reuse
-        ContainerProc/spawn() but need a different key (exec_id) than the
-        container_id field, which for them holds the *target* container
-        rather than their own identity.
+        """key defaults to proc.container_id; exec instances pass exec_id
+        instead, since their container_id field holds the target container.
         """
         with self._lock:
             self._containers[key or proc.container_id] = proc
 
     def get(self, id_or_name: str) -> ContainerProc | None:
-        """Docker API endpoints accept either the container id or its
-        name interchangeably (e.g. `docker logs mytest`); resolve both.
-        """
+        """Resolves by id or name (Docker API accepts either)."""
         with self._lock:
             proc = self._containers.get(id_or_name)
             if proc is not None:
@@ -236,13 +175,8 @@ registry = ContainerRegistry()
 
 def opt_from_request_body(body: dict[str, Any]) -> dict[str, Any]:
     """Maps Docker API create/exec request JSON to udocker engine opt
-    fields. Only covers the fields udocker's engines actually read (see
-    _EXTRA_OPT_DEFAULTS above and ExecutionEngineCommon.opt); silently
-    ignores Docker API fields with no proot/fakechroot equivalent (e.g.
-    resource limits) rather than erroring, since there's no meaningful
-    way to honor them here. Shared by routes/containers.py (create) and
-    routes/exec.py (exec create) — both request shapes use the same
-    field names for Cmd/Env/WorkingDir/User.
+    fields; ignores fields with no proot/fakechroot equivalent (e.g.
+    resource limits). Shared by containers.py and exec.py create.
     """
     opt: dict[str, Any] = {}
     cmd = body.get("Cmd")
@@ -280,27 +214,16 @@ def _run_engine_patched(
     try:
         return int(engine.run(container_id))
     finally:
-        # Safety net: if engine.run() never reached the real launch call
-        # (e.g. errored out during setup before Popen), unpatch() above
-        # never ran and the lock is still held — release it here so a
-        # failed start doesn't wedge every other container/exec forever.
+        # Safety net: if run() errored before reaching Popen, unpatch()
+        # above never ran and the lock would otherwise stay held forever.
         unpatch()
 
 
 def spawn(proc: ContainerProc) -> None:
-    """Starts engine.run() in a background thread so the API call that
-    triggered it (POST /containers/{id}/start) can return immediately,
-    the same way the real Docker daemon does.
-
-    Mutates the given (already-registered, created by /containers/create)
-    ContainerProc in place rather than constructing a new one, so any
-    existing reference to it (e.g. a concurrent /wait call already
-    blocked on its condition variable) keeps observing the same object.
-
-    proc.opt overrides engine.opt entries (cmd, env, vol, user, cwd, ...)
-    — the same fields udocker's own cmdp/CLI-argument parsing would set,
-    which we bypass to drive the engine programmatically from Docker API
-    request JSON instead.
+    """Runs engine.run() in a background thread so POST /start returns
+    immediately, like the real Docker daemon. Mutates the given
+    (already-registered) ContainerProc in place so existing references
+    (e.g. a concurrent /wait) keep observing the same object.
     """
     uctx = udocker_ctx.get()
     supervisor_path = str(supervisor.ensure_supervisor())
@@ -322,20 +245,14 @@ def spawn(proc: ContainerProc) -> None:
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
 
-    # Wait briefly for the pid/pgid the patched Popen call fills in (or
-    # for an immediate failure); falls through (still "created") if the
-    # engine never reaches a Popen call within the timeout, e.g. a setup
-    # error. notify_all() from _make_patched_popen/target wakes this
-    # immediately rather than polling.
+    # Wait briefly for pid/pgid (or immediate failure); falls through
+    # (still "created") if the engine never reaches Popen within timeout.
     with proc.lock:
         proc.lock.wait_for(lambda: proc.pid is not None or proc.status == "exited", timeout=10)
 
 
 def stop(proc: ContainerProc, grace_seconds: float = 10.0) -> None:
-    """Graceful path: SIGTERM the container's process group, wait, then
-    SIGKILL stragglers. Complements the shim's PDEATHSIG crash-path
-    cleanup, which fires automatically without any code here running.
-    """
+    """SIGTERM the container's process group, wait, then SIGKILL stragglers."""
     with proc.lock:
         pgid = proc.pgid
         status = proc.status
@@ -357,10 +274,7 @@ def stop(proc: ContainerProc, grace_seconds: float = 10.0) -> None:
 
 
 def send_signal(proc: ContainerProc, sig: int) -> None:
-    """Direct signal delivery for /containers/{id}/kill, which — unlike
-    /stop — sends exactly the requested signal (SIGKILL by default) with
-    no grace period or SIGTERM-first courtesy.
-    """
+    """Direct signal for /containers/{id}/kill: no grace period, unlike /stop."""
     with proc.lock:
         pgid = proc.pgid
         status = proc.status
@@ -371,22 +285,15 @@ def send_signal(proc: ContainerProc, sig: int) -> None:
 
 
 def stop_all(grace_seconds: float = 10.0) -> None:
-    """Called from the daemon's SIGTERM handler to sweep all running
-    containers before the daemon process itself exits.
-    """
+    """Sweeps all running containers; called from the daemon's SIGTERM handler."""
     for proc in registry.all():
         stop(proc, grace_seconds)
 
 
 def spawn_tty_reader(proc: ContainerProc, master_fd: int) -> None:
-    """One reader thread per TTY session, started right after the pty is
-    allocated. Continuously reads the pty master and fans each chunk out
-    to the logfile (always, so `docker logs` works even after every live
-    client has disconnected) and to any subscribed live attach/exec
-    clients (see subscribe_tty/unsubscribe_tty). A dedicated thread
-    rather than each attach/exec handler reading the master directly,
-    since pty reads are destructive — two readers on the same master
-    would race for bytes instead of both seeing everything.
+    """One reader thread per TTY session: fans pty output out to the
+    logfile and any subscribed clients. Single reader since pty reads are
+    destructive (two readers would race for bytes).
     """
 
     def reader() -> None:
@@ -415,10 +322,8 @@ def spawn_tty_reader(proc: ContainerProc, master_fd: int) -> None:
 
 
 def subscribe_tty(proc: ContainerProc, write: Any, on_error: Any) -> None:
-    """Registers a live attach/exec client to receive pty output as it
-    arrives. `on_error` is called once, without arguments, when the
-    subscriber is dropped (write failure = client disconnected) — used to
-    let the caller know its connection should be considered closed.
+    """Registers a live client for pty output; on_error fires once on
+    write failure (client disconnected).
     """
     with proc.pty_lock:
         proc.subscribers.append((write, on_error))
@@ -436,15 +341,10 @@ def write_tty_stdin(proc: ContainerProc, data: bytes) -> None:
 
 
 def stream_session(proc: ContainerProc, out: Any, in_: Any, *, frame: Any) -> None:
-    """Entry point shared by exec start and attach for streaming a live
-    session to a hijacked (or plain-streamed) connection. Dispatches to
-    the TTY path (subscribe to the pty reader thread, forward stdin, raw
-    passthrough — no frame() wrapping, since a real terminal expects raw
-    bytes) or the non-TTY path (tail_log, output-only, multiplex-framed).
-
-    `in_` is the request's rfile for stdin forwarding; pass None to skip
-    stdin handling entirely (e.g. the plain-HTTP-framing fallback path,
-    which real docker clients don't use for interactive input anyway).
+    """Shared by exec start and attach. TTY path: subscribe to the pty
+    reader, forward stdin, raw passthrough. Non-TTY: tail_log
+    (output-only, multiplex-framed). `in_` is the rfile for stdin
+    forwarding, or None to skip it.
     """
     if not proc.tty:
         tail_log(proc, out, follow=True, frame=frame)
@@ -484,24 +384,14 @@ def stream_session(proc: ContainerProc, out: Any, in_: Any, *, frame: Any) -> No
 
 
 def tail_log(proc: ContainerProc, out: Any, *, follow: bool, frame: Any) -> None:
-    """Streams logfile bytes as they're written rather than dumping the
-    whole file at once — shared by exec start (always follows until the
-    exec exits), /containers/{id}/attach, and /containers/{id}/logs?follow.
-
-    follow=False: read what's there now and stop (plain `docker logs`).
-    follow=True: keep tailing new bytes until the container exits or the
-    write side breaks (client disconnected) — `docker logs -f` / attach.
-
-    `frame` wraps each chunk before writing (Docker's multiplexed stream
-    framing for hijacked connections — see http.py's stream_frame) or is
-    None to write raw bytes (plain, non-hijacked /logs responses).
+    """Streams logfile bytes as written. follow=False: read what's there
+    and stop. follow=True: tail until exit or disconnect (`docker logs
+    -f` / attach). `frame` wraps each chunk (multiplex framing) or None
+    for raw bytes.
     """
     if follow:
-        # docker run's attach happens before start (same reasoning as
-        # ContainerWait — see routes/containers.py's wait() docstring),
-        # so the logfile may not exist yet. Wait for spawn() to create it
-        # rather than giving up immediately, bounded so a container that
-        # never starts doesn't hang this forever.
+        # docker run's attach can happen before start, so the logfile may
+        # not exist yet; wait (bounded) for spawn() to create it.
         deadline = time.time() + 10
         while not os.path.exists(proc.logfile) and time.time() < deadline:
             with proc.lock:

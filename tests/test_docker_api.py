@@ -22,9 +22,7 @@ def client(harness_port):
 
 @pytest.fixture(scope="session", autouse=True)
 def pulled_image(harness_port):
-    """Pulls once per session — every test after the first reuses it,
-    since re-pulling alpine per test would dominate the suite's runtime.
-    """
+    """Pulls once per session; re-pulling per test would dominate runtime."""
     client = docker.DockerClient(base_url=f"tcp://127.0.0.1:{harness_port}")
     client.images.pull(IMAGE)
     client.close()
@@ -88,9 +86,7 @@ def test_container_logs_follow_terminates(client):
 
     assert any(b"one" in line for line in lines)
     assert any(b"two" in line for line in lines)
-    # Should terminate once the container exits, not hang — this guards
-    # against the HTTP/1.1 keep-alive regression where /logs?follow never
-    # returned without an explicit Connection: close.
+    # Regression guard: /logs?follow used to hang without Connection: close.
     assert elapsed < 10
     container.remove()
 
@@ -114,10 +110,8 @@ def test_container_exec(client):
 
 
 def test_container_exec_survives_after_container_running(client):
-    """A regression guard for the lock-scoping bug where exec into a
-    running container hung indefinitely because the container's own
-    engine.run() thread still held the shared subprocess.Popen patch
-    lock.
+    """Regression guard: exec into a running container used to hang on
+    the shared subprocess.Popen patch lock.
     """
     name = _unique_name("execconcurrent")
     container = client.containers.run(IMAGE, command=["sleep", "30"], name=name, detach=True)
@@ -142,8 +136,7 @@ def test_container_kill(client):
 
 def test_container_network_settings_shape(client):
     """Guards the NetworkSettings.Networks nested-map shape (not a flat
-    IPAddress field) that real Docker uses and that `docker inspect -f`
-    templates depend on.
+    IPAddress field).
     """
     name = _unique_name("netshape")
     container = client.containers.run(IMAGE, command=["sleep", "5"], name=name, detach=True)
@@ -156,10 +149,9 @@ def test_container_network_settings_shape(client):
 
 
 def test_docker_run_detached_does_not_hang(harness_port):
-    """Regression guard for the /wait header-timing bug: docker run -d
-    calls ContainerWait (which blocks on response headers) before
-    ContainerStart. If /wait sends headers only after the container
-    exits, docker run hangs indefinitely before /start is ever called.
+    """Regression guard: docker run -d calls ContainerWait (blocks on
+    response headers) before ContainerStart; /wait must send headers
+    before the container exits.
     """
     name = _unique_name("rundhang")
     start = time.monotonic()
@@ -182,9 +174,7 @@ def test_docker_run_detached_does_not_hang(harness_port):
 
 
 def test_docker_run_foreground_attaches(harness_port):
-    """Regression guard for attach connecting before /start creates the
-    logfile (tail_log used to give up immediately on FileNotFoundError).
-    """
+    """Regression guard: attach can connect before /start creates the logfile."""
     result = subprocess.run(
         ["docker", "run", "--rm", IMAGE, "echo", "attach output"],
         env={"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"},

@@ -25,18 +25,12 @@ STREAM_STDERR = 2
 
 def stream_frame(stream_type: int, payload: bytes) -> bytes:
     """Docker's multiplexed stream framing for non-TTY hijacked
-    connections (exec/attach with Tty: false): an 8-byte header — 1 byte
-    stream type, 3 reserved zero bytes, 4-byte big-endian payload length
-    — followed by the payload. Without this the client's stream demuxer
-    tries to parse raw output bytes as frame headers and fails.
-    TTY-attached sessions skip this entirely (raw passthrough); we don't
-    currently allocate a pty, so this framing is always used.
+    connections: 8-byte header (1 byte stream type, 3 reserved, 4-byte
+    big-endian length) + payload. TTY sessions skip this (raw passthrough).
     """
     return struct.pack(">BxxxI", stream_type, len(payload)) + payload
 
-# Docker CLI/SDK prefix requests with a negotiated API version, e.g.
-# "/v1.41/version". Strip it before matching so routes only ever specify
-# the unversioned path.
+# Docker CLI/SDK prefix requests with an API version, e.g. "/v1.41/version".
 _VERSION_PREFIX = re.compile(r"^/v[0-9]+\.[0-9]+(?=/)")
 
 
@@ -116,34 +110,23 @@ class RequestContext:
         )
 
     def start_hijack(self) -> None:
-        """Docker's raw-stream hijack: 101 UPGRADED, then the connection
-        becomes a raw duplex byte stream — no further HTTP framing, read
-        via ctx.rfile / write via ctx.wfile directly. Distinct from
-        start_streaming(), which stays inside normal HTTP response framing
-        (used for non-interactive requests like /containers/{id}/logs).
+        """101 UPGRADED; connection becomes a raw duplex byte stream
+        (read/write via ctx.rfile/wfile directly, no more HTTP framing).
         """
         self._handler.send_response_only(101, "UPGRADED")
         self._handler.send_header("Content-Type", "application/vnd.docker.raw-stream")
         self._handler.send_header("Connection", "Upgrade")
         self._handler.send_header("Upgrade", "tcp")
         self._handler.end_headers()
-        # Once the hijack handler returns, BaseHTTPRequestHandler's
-        # handle() loop would otherwise try to parse a *next* HTTP
-        # request off the now-raw socket — the client is done writing
-        # and expects the connection to close, but the server keeps it
-        # open waiting for a request line that will never come. Docker
-        # clients that read the exec/attach output non-streamed (e.g.
-        # exec_run's default blocking mode) read until EOF and hang
-        # forever without this.
+        # Otherwise BaseHTTPRequestHandler tries to parse a next request
+        # off the now-raw socket, and clients reading until EOF hang.
         self._handler.close_connection = True
 
 
 def make_handler_class(router: Router) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = f"udockerd/{udockerd.__version__}"
-        # Defaults to HTTP/1.0 otherwise, which real Docker's Go HTTP
-        # server never speaks — the docker CLI's client hangs waiting on
-        # exec/attach hijack responses without this.
+        # Default HTTP/1.0 makes the docker CLI's client hang on hijack responses.
         protocol_version = "HTTP/1.1"
 
         def _dispatch(self, method: str) -> None:

@@ -1,11 +1,5 @@
-"""Compiles and caches the container process supervisor (supervisor.c).
-
-Cosmopolitan Python has no ctypes (_ctypes isn't compiled in), so PDEATHSIG
-can't be set via a preexec_fn in-process. Instead we shell out to a tiny
-compiled C supervisor that forks, sets PDEATHSIG, and reaps/cleans up its
-subtree — see supervisor.c for why a plain exec wrapper isn't enough.
-Requires a C compiler (gcc or clang) on PATH at runtime — same tier of
-external dependency as requiring curl (see config.py).
+"""Compiles and caches the container process supervisor (see supervisor.c).
+Requires a C compiler (gcc or clang) on PATH at runtime.
 """
 
 from __future__ import annotations
@@ -40,11 +34,7 @@ def _find_compiler() -> str:
 
 
 def ensure_supervisor() -> Path:
-    """Idempotent: compiles the supervisor once, reuses the cached binary
-    on subsequent calls (and subsequent daemon runs, keyed by source hash
-    so a udockerd upgrade with a changed supervisor recompiles
-    automatically).
-    """
+    """Idempotent: caches by source hash, recompiling on upgrade."""
     source = _source_text()
     binary_path = _cached_binary_path(source)
     if binary_path.exists():

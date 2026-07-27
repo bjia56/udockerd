@@ -39,10 +39,8 @@ def _split_imagespec(imagespec: str) -> tuple[str, str]:
 
 
 def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
-    """Same short-name resolution as routes/images.py — kept local since
-    the two call sites use it slightly differently (this one only needs
-    to check existence, not read manifest details) and importing across
-    route modules for a five-line helper isn't worth the coupling.
+    """Same short-name resolution as routes/images.py, kept local: this
+    call site only checks existence, not manifest details.
     """
     uctx = udocker_ctx.get()
     if uctx.local.cd_imagerepo(imagerepo, tag):
@@ -63,9 +61,6 @@ def _summary(proc: ContainerProc) -> dict[str, Any]:
         "Created": int(proc.started_at or time.time()),
         "State": proc.status,
         "Status": proc.status,
-        # No real network namespace under proot — see _network_settings()
-        # and routes/images.py's sibling honesty note; no exposed ports
-        # to report, real per-network shape but empty addresses below.
         "Ports": [],
         "Labels": {},
         "NetworkSettings": {"Networks": _network_settings()["Networks"]},
@@ -102,16 +97,10 @@ def _inspect_json(proc: ContainerProc) -> dict[str, Any]:
 
 
 def _network_settings() -> dict[str, Any]:
-    """proot has no real network namespace — every container effectively
-    shares the Termux host's network stack (like --net=host always).
-    Real Docker's NetworkSettings nests everything under a Networks map
-    keyed by network name (with IPAddress/Gateway/MacAddress etc per
-    entry), not the flat IPAddress/Ports shape a naive stub might use —
-    matching that shape matters for tools/scripts that read
-    .NetworkSettings.Networks.<name>.IPAddress via `docker inspect -f`.
-    Reports a single "host" entry with every address field honestly
-    empty, the same shape real Docker uses for actual --net=host
-    containers, rather than fabricating a per-container IP.
+    """proot has no real network namespace (effectively always
+    --net=host). Reports a single "host" entry under Networks, matching
+    real Docker's map shape, with address fields honestly empty rather
+    than fabricated.
     """
     return {
         "Ports": {},
@@ -202,10 +191,8 @@ def stop(ctx: RequestContext) -> None:
 
 
 def kill(ctx: RequestContext) -> None:
-    """Unlike /stop, no grace period/SIGTERM-first courtesy — kill means
-    kill. docker run (even -d) calls this defensively to clean up a
-    container it believes failed to start; without this route 404ing
-    unpredictably interacted badly with the CLI's own error handling.
+    """Unlike /stop, no grace period. docker run also calls this
+    defensively on failed starts.
     """
     container_id = ctx.params["id"]
     proc = container_proc.registry.get(container_id)
@@ -279,27 +266,19 @@ def logs(ctx: RequestContext) -> None:
     query = _query(ctx)
     follow = query.get("follow", ["0"])[0] in ("1", "true")
 
-    # No Content-Length (unknown until we stop streaming) and not a
-    # hijack/Upgrade — same HTTP/1.1 framing ambiguity as /wait: without
-    # Connection: close, the client waits for the connection to close as
-    # its end-of-stream signal, but the server tries to keep it alive for
-    # a next request. Neither side ever terminates.
+    # Connection: close required: no Content-Length, not a hijack, so
+    # under HTTP/1.1 the client needs an explicit end-of-body signal.
     ctx.start_streaming(
         200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
     )
-    # Never a TTY (we don't allocate ptys), so — same as exec — output
-    # needs Docker's multiplexed stream framing, not raw bytes.
     container_proc.tail_log(
         proc, ctx.wfile, follow=follow, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
     )
 
 
 def attach(ctx: RequestContext) -> None:
-    """Streams the running container's output live. For TTY containers,
-    joins the live pty session (raw passthrough, stdin forwarded) via
-    stream_session; otherwise the same live-tail-until-exit as
-    /logs?follow, wrapped in the hijack handshake instead of plain HTTP
-    framing when the client requests it.
+    """TTY: joins the live pty session (raw passthrough, stdin forwarded).
+    Non-TTY: live-tail-until-exit, same as /logs?follow.
     """
     container_id = ctx.params["id"]
     proc = container_proc.registry.get(container_id)
@@ -311,7 +290,6 @@ def attach(ctx: RequestContext) -> None:
     if hijacked:
         ctx.start_hijack()
     else:
-        # Same Connection: close reasoning as /logs above.
         ctx.start_streaming(
             200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
         )
@@ -325,19 +303,11 @@ def attach(ctx: RequestContext) -> None:
 
 
 def wait(ctx: RequestContext) -> None:
-    """Blocks until the container exits, as `docker run` (not just
-    `docker start`) relies on to know when to stop attaching/return.
-
-    The real Docker client's ContainerWait synchronously blocks until it
-    receives *response headers* — separately from reading the body, which
-    it does in a background goroutine — specifically so it can call this
-    before ContainerStart and synchronize on header receipt without
-    waiting for the container to actually exit. If we send headers and
-    body together only once the container exits (send_json's usual
-    behavior), that header-wait blocks forever, since headers never
-    arrive until the thing the client is waiting on already happened —
-    docker run then hangs indefinitely before it ever calls /start.
-    Send headers immediately, then block on the body write instead.
+    """Blocks until the container exits. The real client's ContainerWait
+    blocks on receiving *response headers* (before ContainerStart), reading
+    the body separately in the background — so headers must be sent
+    immediately here, before we block, or docker run hangs waiting for
+    headers that only arrive after the thing it's waiting on already happened.
     """
     container_id = ctx.params["id"]
     proc = container_proc.registry.get(container_id)
@@ -345,9 +315,6 @@ def wait(ctx: RequestContext) -> None:
         ctx.send_json(404, {"message": f"No such container: {container_id}"})
         return
 
-    # No Content-Length (body length isn't known yet) and this isn't a
-    # hijack/Upgrade — under HTTP/1.1 that's ambiguous framing unless we
-    # say explicitly that connection-close marks the end of the body.
     ctx.start_streaming(200, {"Content-Type": "application/json", "Connection": "close"})
 
     with proc.lock:

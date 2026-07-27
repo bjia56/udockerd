@@ -23,19 +23,12 @@ def serve(host: str, port: int) -> None:
     httpd = ThreadingHTTPServer((host, port), handler_cls)
 
     def shutdown_gracefully() -> None:
-        # Graceful path: SIGTERM each running container's process group,
-        # wait, then SIGKILL stragglers, before the daemon itself exits.
-        # Complements the process supervisor's own PDEATHSIG-triggered
-        # cleanup, which covers the case this never runs at all (e.g.
-        # SIGKILL to the daemon).
         container_proc.stop_all()
         httpd.shutdown()
 
     def handle_sigterm(signum: int, frame: FrameType | None) -> None:
-        # httpd.shutdown() blocks until serve_forever()'s loop (running on
-        # this same thread) notices the shutdown flag and returns — which
-        # can't happen while we're still inside this handler. Run it on a
-        # separate thread instead of inline.
+        # httpd.shutdown() blocks until serve_forever()'s loop (same
+        # thread) notices, so it can't run inline from this handler.
         threading.Thread(target=shutdown_gracefully, daemon=True).start()
 
     signal.signal(signal.SIGTERM, handle_sigterm)
