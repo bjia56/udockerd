@@ -347,3 +347,46 @@ def stop_all(grace_seconds: float = 10.0) -> None:
     """
     for proc in registry.all():
         stop(proc, grace_seconds)
+
+
+def tail_log(proc: ContainerProc, out: Any, *, follow: bool, frame: Any) -> None:
+    """Streams logfile bytes as they're written rather than dumping the
+    whole file at once — shared by exec start (always follows until the
+    exec exits), /containers/{id}/attach, and /containers/{id}/logs?follow.
+
+    follow=False: read what's there now and stop (plain `docker logs`).
+    follow=True: keep tailing new bytes until the container exits or the
+    write side breaks (client disconnected) — `docker logs -f` / attach.
+
+    `frame` wraps each chunk before writing (Docker's multiplexed stream
+    framing for hijacked connections — see http.py's stream_frame) or is
+    None to write raw bytes (plain, non-hijacked /logs responses).
+    """
+    if follow:
+        # docker run's attach happens before start (same reasoning as
+        # ContainerWait — see routes/containers.py's wait() docstring),
+        # so the logfile may not exist yet. Wait for spawn() to create it
+        # rather than giving up immediately, bounded so a container that
+        # never starts doesn't hang this forever.
+        deadline = time.time() + 10
+        while not os.path.exists(proc.logfile) and time.time() < deadline:
+            with proc.lock:
+                if proc.status == "exited":
+                    break
+            time.sleep(0.05)
+
+    with contextlib.suppress(FileNotFoundError), open(proc.logfile, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if chunk:
+                try:
+                    out.write(frame(chunk) if frame else chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                continue
+            if not follow:
+                return
+            with proc.lock:
+                if proc.status == "exited":
+                    return
+            time.sleep(0.05)

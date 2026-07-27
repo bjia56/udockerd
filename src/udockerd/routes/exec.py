@@ -11,11 +11,9 @@ won't show the main container's processes). Documented in DESIGN.md.
 
 from __future__ import annotations
 
-import contextlib
-import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from udockerd import container_proc
 from udockerd.http import STREAM_STDOUT, stream_frame
@@ -79,33 +77,19 @@ def start(ctx: RequestContext) -> None:
     if ctx.is_upgrade_request():
         ctx.start_hijack()
     else:
-        ctx.start_streaming(200, {"Content-Type": "application/vnd.docker.raw-stream"})
+        # Without Connection: close, HTTP/1.1 keep-alive means the client
+        # waits for connection close as end-of-stream while the server
+        # tries to keep it open for a next request — neither side ever
+        # terminates. Same issue as /wait and /logs.
+        ctx.start_streaming(
+            200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
+        )
 
-    _tail_log_until_exit(exec_proc, ctx.wfile)
-
-
-def _tail_log_until_exit(proc: container_proc.ContainerProc, out: Any) -> None:
-    """Streams new bytes from the logfile as they're written, rather than
-    blocking until exit and dumping the whole file at once — an
-    interactive `docker exec` should see output as it happens. Each chunk
-    is wrapped in Docker's multiplexed stream framing (see http.py); the
-    logfile mixes stdout+stderr together (Popen redirects both to the
-    same fd), so everything is framed as stdout.
-    """
-    with contextlib.suppress(FileNotFoundError), open(proc.logfile, "rb") as f:
-        while True:
-            chunk = f.read(65536)
-            if chunk:
-                out.write(stream_frame(STREAM_STDOUT, chunk))
-                continue
-            with proc.lock:
-                if proc.status == "exited":
-                    break
-            time.sleep(0.05)
-        # Drain any bytes written between the last read and exit.
-        remainder = f.read()
-        if remainder:
-            out.write(stream_frame(STREAM_STDOUT, remainder))
+    # logfile mixes stdout+stderr together (Popen redirects both to the
+    # same fd), so everything is framed as stdout.
+    container_proc.tail_log(
+        exec_proc, ctx.wfile, follow=True, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
+    )
 
 
 def inspect(ctx: RequestContext) -> None:

@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 from udocker.container.structure import ContainerStructure
 
 from udockerd import container_proc, udocker_ctx
+from udockerd.http import STREAM_STDOUT, stream_frame
 from udockerd.routes import exec as exec_routes
 
 if TYPE_CHECKING:
@@ -236,10 +237,48 @@ def logs(ctx: RequestContext) -> None:
         ctx.send_json(404, {"message": f"No such container: {container_id}"})
         return
 
-    ctx.start_streaming(200, {"Content-Type": "application/vnd.docker.raw-stream"})
-    with contextlib.suppress(FileNotFoundError), open(proc.logfile, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            ctx.wfile.write(chunk)
+    query = _query(ctx)
+    follow = query.get("follow", ["0"])[0] in ("1", "true")
+
+    # No Content-Length (unknown until we stop streaming) and not a
+    # hijack/Upgrade — same HTTP/1.1 framing ambiguity as /wait: without
+    # Connection: close, the client waits for the connection to close as
+    # its end-of-stream signal, but the server tries to keep it alive for
+    # a next request. Neither side ever terminates.
+    ctx.start_streaming(
+        200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
+    )
+    # Never a TTY (we don't allocate ptys), so — same as exec — output
+    # needs Docker's multiplexed stream framing, not raw bytes.
+    container_proc.tail_log(
+        proc, ctx.wfile, follow=follow, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
+    )
+
+
+def attach(ctx: RequestContext) -> None:
+    """Streams the running container's output live. Since proot has no
+    real process to "attach" a live pty/pipe to after the fact (stdout is
+    already being redirected to the logfile from spawn time), this is the
+    same live-tail-until-exit as /logs?follow, wrapped in the hijack
+    handshake instead of plain HTTP framing when the client requests it.
+    """
+    container_id = ctx.params["id"]
+    proc = container_proc.registry.get(container_id)
+    if proc is None:
+        ctx.send_json(404, {"message": f"No such container: {container_id}"})
+        return
+
+    if ctx.is_upgrade_request():
+        ctx.start_hijack()
+    else:
+        # Same Connection: close reasoning as /logs above.
+        ctx.start_streaming(
+            200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
+        )
+
+    container_proc.tail_log(
+        proc, ctx.wfile, follow=True, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
+    )
 
 
 def wait(ctx: RequestContext) -> None:
@@ -284,3 +323,4 @@ def register(router: Router) -> None:
     router.add("GET", r"^/containers/(?P<id>[^/]+)/json$", inspect)
     router.add("GET", r"^/containers/(?P<id>[^/]+)/logs$", logs)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/wait$", wait)
+    router.add("POST", r"^/containers/(?P<id>[^/]+)/attach$", attach)
