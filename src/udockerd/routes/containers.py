@@ -63,11 +63,12 @@ def _summary(proc: ContainerProc) -> dict[str, Any]:
         "Created": int(proc.started_at or time.time()),
         "State": proc.status,
         "Status": proc.status,
-        # No real network namespace under proot — see routes/images.py's
-        # sibling honesty note; ports/networking are stubbed empty here
-        # too rather than fabricated.
+        # No real network namespace under proot — see _network_settings()
+        # and routes/images.py's sibling honesty note; no exposed ports
+        # to report, real per-network shape but empty addresses below.
         "Ports": [],
         "Labels": {},
+        "NetworkSettings": {"Networks": _network_settings()["Networks"]},
     }
 
 
@@ -87,11 +88,39 @@ def _inspect_json(proc: ContainerProc) -> dict[str, Any]:
         "Config": {
             "Image": proc.image,
         },
-        # Honest network stub: proot shares the host network stack, no
-        # per-container isolation to report.
-        "NetworkSettings": {
-            "IPAddress": "",
-            "Ports": {},
+        "NetworkSettings": _network_settings(),
+    }
+
+
+def _network_settings() -> dict[str, Any]:
+    """proot has no real network namespace — every container effectively
+    shares the Termux host's network stack (like --net=host always).
+    Real Docker's NetworkSettings nests everything under a Networks map
+    keyed by network name (with IPAddress/Gateway/MacAddress etc per
+    entry), not the flat IPAddress/Ports shape a naive stub might use —
+    matching that shape matters for tools/scripts that read
+    .NetworkSettings.Networks.<name>.IPAddress via `docker inspect -f`.
+    Reports a single "host" entry with every address field honestly
+    empty, the same shape real Docker uses for actual --net=host
+    containers, rather than fabricating a per-container IP.
+    """
+    return {
+        "Ports": {},
+        "Networks": {
+            "host": {
+                "IPAMConfig": None,
+                "Links": None,
+                "Aliases": None,
+                "NetworkID": "",
+                "EndpointID": "",
+                "Gateway": "",
+                "IPAddress": "",
+                "IPPrefixLen": 0,
+                "IPv6Gateway": "",
+                "GlobalIPv6Address": "",
+                "GlobalIPv6PrefixLen": 0,
+                "MacAddress": "",
+            },
         },
     }
 
