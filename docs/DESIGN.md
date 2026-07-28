@@ -43,9 +43,32 @@ Core container + image lifecycle, plus exec and attach/logs streaming:
 - `/containers/{id}/exec` + `/exec/{id}/start` (exec)
 - `/containers/{id}/attach` (attach/streaming)
 - `/images/create` (pull), `/images/json` (list), `/images/{name}` (rm), `/images/{name}/json` (inspect)
+- `/build` (design only, not yet implemented — see Build section below)
 - `/version`, `/info`, `/_ping`
 
-Out of scope for v1: networks-as-objects, volumes-as-objects, swarm, build, compose-level features.
+Out of scope for v1: networks-as-objects, volumes-as-objects, swarm, compose-level features. `build` is designed (see below) but not yet implemented.
+
+### Build (`docker build`)
+
+**Protocol: classic builder only (`POST /build`), not BuildKit.** Modern `docker` CLI defaults to BuildKit — a gRPC session over an HTTP/2-upgraded connection, solving an LLB graph — which has no pure-stdlib Python implementation and conflicts outright with the cosmo-bundling constraint. Classic `/build` (tar context in, JSON-lines progress out) is what docker-py's `APIClient.build()`/`images.build()` speak by default, and what the `docker` CLI speaks with `DOCKER_BUILDKIT=0`. Document that env var (or docker-py) as a client-side runtime requirement, same tier as "needs `curl` on PATH."
+
+Query params handled: `t` (repeatable — tag(s) to apply to the final image), `dockerfile` (path within the context, default `Dockerfile`), `buildargs` (JSON-encoded dict), `labels` (JSON-encoded dict), `target` (stage name, multi-stage). Accepted and ignored: `q`, `nocache`, `rm`, `forcerm`, `pull`, `cachefrom`, `networkmode`, `shmsize`, `squash`, `platform` — there's no build cache or separate "intermediate container" concept here (see Layering), and no cross-arch support. Request body is the build context tar, optionally gzipped (`tarfile.open(mode="r|*")` autodetects), extracted to a temp dir with `tarfile.extractall`.
+
+Response is `Content-Type: application/json`, `Connection: close`, chunked JSON-lines — the same streaming shape as `/images/create`. Each instruction emits `{"stream": "Step N/M : <instruction>\n"}`, with captured `RUN` output as further `{"stream": ...}` lines. Failure: `{"errorDetail": {"message": ...}, "error": ...}`, then stop. **Success must end with a `{"stream": "Successfully built <12-hex-id>\n"}` line** (plus one `{"stream": "Successfully tagged <repo>:<tag>\n"}` per `-t`) — docker-py's `images.build()` regexes exactly that phrase out of the stream to resolve the built image id, and raises `BuildError` on an otherwise-successful build if it's missing.
+
+**Layering: one flattened layer per build, not per-instruction.** Real docker gets cheap per-instruction layers from OverlayFS CoW diffs; proot/Termux has no such filesystem, so matching that would mean a full-tree snapshot-and-hash before/after every `RUN`/`COPY` — expensive, and still not real fidelity. Same trade-off already made for networking (see Network fidelity below): be honest about the platform's limits instead of faking it. Consequence: no build cache (`nocache` is moot), and multi-instruction Dockerfiles produce one bigger layer instead of docker's many small reused ones.
+
+Mechanics: each stage builds in a throwaway container via `ContainerStructure(uctx.local).create_fromimage(base_imagerepo, base_tag)` — the same call `/containers/create` already uses — running instructions against its `container_dir/ROOT`. At the end of the *final* stage, the whole `ROOT` is tarred (`FileUtil(...).tar()`) into one layer blob, and a v2-schema2 manifest + config JSON are synthesized, mirroring the `setup_tag()` → `set_version("v2")` → `save_json("manifest", ...)` → `add_image_layer()` sequence `DockerIoAPI.get_v2()` already uses for pulled images. Non-final stages build the same way but stay unregistered scratch containers (never appear in `/images/json`) until every `COPY --from=<stage>` referencing them has run, then get deleted.
+
+**Dockerfile support:** a single-pass parser (trailing-`\` line continuation, `#` comments, `ARG`/`ENV` `$VAR`/`${VAR}` substitution) producing an instruction list per stage. Supported: `FROM [... AS name]`, `RUN` (shell and exec form), `COPY [--from=stage|image]`, `ADD` (local files, tar auto-extraction, URL fetch via the same forced-curl path as image pulls — no remote/git build contexts), `ENV`, `WORKDIR`, `CMD`, `ENTRYPOINT`, `USER`, `LABEL`, `EXPOSE` (metadata-only, consistent with no real network namespace), `ARG`, `VOLUME` (metadata-only, consistent with no volumes-as-objects), `STOPSIGNAL`. Unsupported instructions (`HEALTHCHECK`, `ONBUILD`, `SHELL`, BuildKit-only flags like `--mount=`) fail the build with a clear `{"error": ...}` instead of silently no-opping.
+
+- `RUN` executes through the same `ExecutionMode(...).get_engine()` + supervisor-prepend path as `container_proc.spawn()`, but synchronously (a build is one blocking streamed request, unlike `/start`'s fire-and-return) with stdout/stderr piped line-by-line into `{"stream": ...}` frames instead of a logfile. Non-zero exit aborts with `{"error": "The command '...' returned a non-zero code: N"}`, matching real docker's message shape.
+- `COPY`/`ADD` without `--from` resolve against the extracted build-context temp dir straight on the host filesystem — no proot involved, same as how container creation already untars image layers directly.
+- `COPY --from=<stage>` copies between the two scratch containers' `ROOT` dirs directly (host-side copy). `COPY --from=<image>` runs `ContainerStructure.create_fromimage` on that image into a throwaway extraction dir first.
+
+New module: `routes/build.py` (`POST /build`) as thin request/response glue, backed by a new `builder.py` for Dockerfile parsing and stage execution — keeping the same split `container_proc.py`/routes already use.
+
+Explicitly out of scope, same tier as the list above: BuildKit protocol, build cache, per-instruction layers, `HEALTHCHECK`/`ONBUILD`/`SHELL`, remote/git build contexts, `--mount=`/secrets, cross-arch `--platform` builds, image squashing beyond the single-layer default.
 
 ### Process tracking
 In-memory registry only: `{container_id: {pid, pgid, logfile, status, ...}}`. `docker run`/`exec` spawns the real proot-wrapped process via the udocker engine, monkeypatching `subprocess.Popen` for the scope of the engine's own `run()` call (it builds its command and calls `subprocess.call()` directly with no exposed hook — see `container_proc.py`). stdout/stderr redirected to a per-container log file. Daemon restart loses live state — acceptable, since the proot processes don't survive a daemon restart anyway.
