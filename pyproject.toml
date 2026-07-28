@@ -31,7 +31,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-udockerd = ["data/supervisor.c"]
+udockerd = ["data/supervisor.c", "data/bin/supervisor-*"]
 
 [tool.ruff]
 target-version = "py312"

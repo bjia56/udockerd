@@ -51,7 +51,7 @@ Out of scope for v1: networks-as-objects, volumes-as-objects, swarm, build, comp
 In-memory registry only: `{container_id: {pid, pgid, logfile, status, ...}}`. `docker run`/`exec` spawns the real proot-wrapped process via the udocker engine, monkeypatching `subprocess.Popen` for the scope of the engine's own `run()` call (it builds its command and calls `subprocess.call()` directly with no exposed hook — see `container_proc.py`). stdout/stderr redirected to a per-container log file. Daemon restart loses live state — acceptable, since the proot processes don't survive a daemon restart anyway.
 
 ### Process cleanup on daemon exit
-No root/namespaces/cgroups (Termux), no ctypes in Cosmopolitan Python (rules out `prctl` via FFI). Orphan prevention uses a small compiled C supervisor (`data/supervisor.c`, compiled and cached on first use, requires `cc`/`gcc`/`clang` on PATH), prepended in front of every container command:
+No root/namespaces/cgroups (Termux), no ctypes in Cosmopolitan Python (rules out `prctl` via FFI). Orphan prevention uses a small C supervisor (`data/supervisor.c`), prepended in front of every container command. Prebuilt static binaries ship for x86_64/aarch64; other arches compile it on first use via `cc`/`gcc`/`clang` on PATH.
 
 - **Why a supervisor, not a plain PDEATHSIG exec wrapper**: `PR_SET_PDEATHSIG` only fires on the exact process that set it. udocker's proot engine forks its own traced child to run the container command — that fork doesn't inherit the watch, so a plain wrapper would kill proot on daemon death but orphan proot's child.
 - **The supervisor**: `setsid()`s itself, sets its own `PR_SET_PDEATHSIG` to `SIGTERM`, then `fork()`s — the child execs the real command, the supervisor stays alive reaping its child via a `waitpid` loop.
@@ -94,10 +94,11 @@ Run udockerd inside a plain (non-privileged, no docker-in-docker) Docker contain
 
 Cosmopolitan libc bundling (`.github/workflows/build.yml`), following [bodega's build-multiplatform job](https://github.com/bjia56/bodega/blob/main/.github/workflows/build.yml):
 1. Start from Cosmopolitan Python executable (APE).
-2. Bundle setuptools into it (needed for the pip install step against the frozen interpreter).
-3. `pip wheel` udockerd, `pip install` it (pulling in udocker as a normal dependency) into a temp dir, zip-embed both into the cosmo Python executable's `Lib/site-packages/`.
-4. Append `scripts/.args` (`-m udockerd`) so the resulting executable runs the daemon by default with no arguments needed.
-5. chimplink for multiplatform APE support — x86_64/aarch64 natively via `ape-*.elf`, plus blink for less-common Linux architectures (powerpc64le, i386, riscv64, loongarch64, s390x). Unlike bodega, **no non-Linux targets** — udockerd only runs on Linux (proot has no other target). `udockerd.config.check_linux()` fails fast on a non-Linux platform.
-6. CI verifies the built binary actually runs (`--help`) on a real Linux x86_64 GitHub Actions runner.
+2. Build static supervisor binaries for x86_64/aarch64 with `zig cc` (musl target), dropped into `data/bin/` before packaging — see [supervisor.py](#process-cleanup-on-daemon-exit).
+3. Bundle setuptools into it (needed for the pip install step against the frozen interpreter).
+4. `pip wheel` udockerd, `pip install` it (pulling in udocker as a normal dependency) into a temp dir, zip-embed both into the cosmo Python executable's `Lib/site-packages/`.
+5. Append `scripts/.args` (`-m udockerd`) so the resulting executable runs the daemon by default with no arguments needed.
+6. chimplink for multiplatform APE support — x86_64/aarch64 natively via `ape-*.elf`, plus blink for less-common Linux architectures (powerpc64le, i386, riscv64, loongarch64, s390x). Unlike bodega, **no non-Linux targets** — udockerd only runs on Linux (proot has no other target). `udockerd.config.check_linux()` fails fast on a non-Linux platform.
+7. CI verifies the built binary actually runs (`--help`) on a real Linux x86_64 GitHub Actions runner.
 
 Runtime-external, not bundled: `curl`, `proot`/`fakechroot` binaries (udocker downloads these itself on first use), and a C compiler for the process supervisor (compiled on first use, since cosmo Python has no `ctypes`).

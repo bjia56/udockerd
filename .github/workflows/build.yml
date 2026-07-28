@@ -13,12 +13,28 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Get Cosmopolitan Python
         run: |
           wget https://cosmo.zip/pub/cosmos/bin/python -O python.exe
           chmod +x python.exe
+
+      - name: Set up zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+
+      - name: Build supervisor binaries
+        run: |
+          # Static binaries for the process supervisor (see supervisor.py),
+          # so udockerd doesn't need a C compiler on the target machine.
+          mkdir -p src/udockerd/data/bin
+          for arch in x86_64 aarch64; do
+            zig cc -target "$arch-linux-musl" -O2 -static -s \
+              -o src/udockerd/data/bin/supervisor-$arch \
+              src/udockerd/data/supervisor.c
+          done
 
       - name: Bundle setuptools
         run: |
@@ -102,7 +118,7 @@ jobs:
           ./udockerd-unknown-unknown --help
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: udockerd-unknown-unknown
           path: udockerd-unknown-unknown

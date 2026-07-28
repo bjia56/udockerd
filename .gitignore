@@ -209,6 +209,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Supervisor binaries built by .github/workflows/build.yml (zig cc)
+src/udockerd/data/bin/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
