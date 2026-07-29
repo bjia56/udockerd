@@ -4,10 +4,8 @@ context tar in, JSON-lines progress out.
 
 from __future__ import annotations
 
-import io
 import json
 import shutil
-import tarfile
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,16 +29,6 @@ def _parse_json_param(query: dict[str, list[str]], key: str) -> dict[str, str]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Rejects tar entries that would extract outside dest."""
-    dest_resolved = dest.resolve()
-    for member in tar.getmembers():
-        member_path = (dest_resolved / member.name).resolve()
-        if member_path != dest_resolved and dest_resolved not in member_path.parents:
-            raise builder.ParseError(f"build context tar entry escapes context: {member.name}")
-    tar.extractall(dest_resolved)  # noqa: S202 - members validated above
-
-
 def build(ctx: RequestContext) -> None:
     query = _query(ctx)
     tags = query.get("t", [])
@@ -52,12 +40,15 @@ def build(ctx: RequestContext) -> None:
     body = ctx.read_body()
     context_dir = Path(tempfile.mkdtemp(prefix="udockerd-build-"))
     try:
+        context_tar = context_dir / ".context.tar"
+        context_tar.write_bytes(body)
         try:
-            with tarfile.open(fileobj=io.BytesIO(body), mode="r|*") as tar:
-                _safe_extract(tar, context_dir)
-        except tarfile.TarError as exc:
+            builder.extract_tar(context_tar, context_dir)
+        except builder.BuildError as exc:
             ctx.send_json(400, {"message": f"invalid build context: {exc}"})
             return
+        finally:
+            context_tar.unlink(missing_ok=True)
 
         dockerfile_path = context_dir / dockerfile_rel
         if not dockerfile_path.is_file():

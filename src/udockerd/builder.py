@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import platform
 import queue
 import shlex
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from udocker.container.structure import ContainerStructure
 from udocker.engine.execmode import ExecutionMode
+from udocker.helper.hostinfo import HostInfo
+from udocker.utils.fileutil import FileUtil
 
 from udockerd import udocker_ctx
 from udockerd.container_proc import called_from_engine_run, original_popen, patch_lock
@@ -43,6 +49,29 @@ _METADATA_INSTRUCTIONS = frozenset(
 )
 
 _KNOWN_INSTRUCTIONS = _METADATA_INSTRUCTIONS | {"FROM", "RUN", "COPY", "ADD"}
+
+
+def extract_tar(tar_path: Path, dest_dir: Path) -> None:
+    """Extracts tar_path into dest_dir via the system tar binary, same
+    approach udocker itself uses for image layers. Members are validated
+    for path-traversal with tarfile first, since tar -x itself won't
+    reject them.
+    """
+    dest_resolved = dest_dir.resolve()
+    with tarfile.open(tar_path, mode="r:*") as tar:
+        for member in tar.getmembers():
+            member_path = (dest_resolved / member.name).resolve()
+            if member_path != dest_resolved and dest_resolved not in member_path.parents:
+                raise BuildError(f"tar entry escapes destination: {member.name}")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(  # noqa: S603
+        ["tar", "-C", str(dest_dir), "-xf", str(tar_path)],  # noqa: S607
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BuildError(f"failed to extract tar: {result.stderr.decode(errors='replace')}")
 
 
 class ParseError(Exception):
@@ -93,8 +122,9 @@ def _exec_form_cmd(instruction_args: str) -> list[str] | None:
 @dataclass
 class StageConfig:
     """Accumulates metadata-instruction state for one stage. Field names
-    match Docker's image config JSON `Config` section directly, so
-    commit_layer can pass this straight through with no translation.
+    match Docker's image config JSON `Config` section; Env is kept as a
+    dict here for easy merging/lookup and converted to Docker's
+    "KEY=VALUE" list wire form by to_image_config().
     """
 
     Env: dict[str, str] = field(default_factory=dict)
@@ -119,6 +149,23 @@ class StageConfig:
         if self.User:
             opt["user"] = self.User
         return opt
+
+    def to_image_config(self) -> dict[str, Any]:
+        """Docker image config JSON's `Config` section shape: Env as
+        "KEY=VALUE" strings, matching what a real docker build produces
+        and what docker-py/CLI expect to parse.
+        """
+        return {
+            "Env": [f"{k}={v}" for k, v in self.Env.items()],
+            "WorkingDir": self.WorkingDir,
+            "User": self.User,
+            "Cmd": self.Cmd,
+            "Entrypoint": self.Entrypoint,
+            "Labels": self.Labels,
+            "ExposedPorts": self.ExposedPorts,
+            "Volumes": self.Volumes,
+            "StopSignal": self.StopSignal,
+        }
 
 
 def apply_metadata_instruction(op: str, args: str, config: StageConfig) -> None:
@@ -433,9 +480,7 @@ def copy_instruction(
                 and tarfile.is_tarfile(src_path)
             )
             if is_tar_add:
-                dest_path.mkdir(parents=True, exist_ok=True)
-                with tarfile.open(src_path, mode="r:*") as tar:
-                    tar.extractall(dest_path)  # noqa: S202 - context-local tar, escape already ruled out above
+                extract_tar(src_path, dest_path)
                 continue
 
             target = dest_path / src_path.name if dest_is_dir else dest_path
@@ -530,12 +575,84 @@ def run_instruction(
         raise BuildError(f"The command '{' '.join(cmd)}' returned a non-zero code: {exit_code}")
 
 
+_MANIFEST_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+_CONFIG_MEDIA_TYPE = "application/vnd.docker.container.image.v1+json"
+_LAYER_MEDIA_TYPE = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+
+
+def _sha256_digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return f"sha256:{hasher.hexdigest()}"
+
+
 def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str:
     """Flattens the given container's ROOT into a single image layer,
-    synthesizes a v2-schema2 manifest + config, and registers each tag.
-    Returns the image id.
+    synthesizes a v2-schema2 manifest + config, and registers each
+    requested tag against it. Returns the image (config) digest.
+
+    Mirrors the setup_tag() -> set_version("v2") -> save_json("manifest",
+    ...) -> add_image_layer() sequence DockerIoAPI.get_v2() uses for
+    pulled images, so inspect/list read this the same way as a real pull.
     """
-    raise NotImplementedError
+    uctx = udocker_ctx.get()
+    container_dir = Path(uctx.local.cd_container(container_id))
+    root = container_dir / "ROOT"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        layer_tar = Path(tmp) / "layer.tar"
+        if not FileUtil().tar(str(layer_tar), sourcedir=str(root)):
+            raise BuildError("failed to create image layer tar")
+        layer_digest = _sha256_digest(layer_tar)
+        layer_size = layer_tar.stat().st_size
+
+        docker_arch = HostInfo().get_arch("uname", platform.machine(), "docker")
+
+        config_json = {
+            "architecture": docker_arch[0] if docker_arch else "amd64",
+            "os": "linux",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "config": config.to_image_config(),
+        }
+        config_bytes = json.dumps(config_json).encode("utf-8")
+        config_digest = f"sha256:{hashlib.sha256(config_bytes).hexdigest()}"
+
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": _MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": _CONFIG_MEDIA_TYPE,
+                "size": len(config_bytes),
+                "digest": config_digest,
+            },
+            "layers": [
+                {
+                    "mediaType": _LAYER_MEDIA_TYPE,
+                    "size": layer_size,
+                    "digest": layer_digest,
+                }
+            ],
+        }
+
+        if not tags:
+            tags = [f"udockerd-build:{config_digest.split(':', 1)[1][:12]}"]
+
+        for tag_spec in tags:
+            imagerepo, tag = udocker_ctx.split_imagespec(tag_spec)
+            uctx.local.setup_imagerepo(imagerepo)
+            if not (uctx.local.setup_tag(tag) and uctx.local.set_version("v2")):
+                raise BuildError(f"failed to register tag: {tag_spec}")
+            uctx.local.save_json(config_digest, config_json)
+            uctx.local.save_json("manifest", manifest)
+
+            layer_dest = Path(uctx.local.layersdir) / layer_digest
+            if not layer_dest.exists():
+                shutil.copy2(layer_tar, layer_dest)
+            uctx.local.add_image_layer(str(layer_dest))
+
+    return config_digest
 
 
 def _find_target_index(stages: list[Stage], target: str) -> int:
