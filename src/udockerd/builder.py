@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import queue
 import shlex
+import shutil
 import subprocess
+import tarfile
 import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -196,6 +198,98 @@ def parse_dockerfile(text: str, buildargs: dict[str, str] | None = None) -> list
         raise ParseError("Dockerfile has no FROM instruction")
 
     return stages
+
+
+def _parse_copy_args(args: str) -> tuple[list[str], str]:
+    """COPY/ADD ["src", ..., "dest"] or whitespace-separated shell form.
+    --chown=/--chmod= flags are accepted and ignored (no uid mapping
+    under proot). Returns (sources, dest); last item is always dest.
+    """
+    stripped = args.strip()
+    if stripped.startswith("["):
+        parsed = json.loads(stripped)
+        if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
+            raise ParseError(f"invalid COPY/ADD instruction: {args}")
+        tokens = list(parsed)
+    else:
+        tokens = [t for t in shlex.split(stripped) if not t.startswith("--")]
+    if len(tokens) < 2:
+        raise ParseError(f"COPY/ADD requires at least one source and a destination: {args}")
+    return tokens[:-1], tokens[-1]
+
+
+def _resolve_context_path(context_dir: Path, src: str) -> Path:
+    """Resolves src against the build context, rejecting escapes."""
+    resolved = (context_dir / src).resolve()
+    context_resolved = context_dir.resolve()
+    if resolved != context_resolved and context_resolved not in resolved.parents:
+        raise BuildError(f"path outside build context: {src}")
+    return resolved
+
+
+def _resolve_dest_path(root: Path, workdir: str, dest: str) -> Path:
+    """Resolves dest against the container ROOT + current WORKDIR, same
+    as real Docker's relative-COPY-destination semantics.
+    """
+    base = root / workdir.lstrip("/") if workdir else root
+    dest_path = base / dest.lstrip("/") if not dest.startswith("/") else root / dest.lstrip("/")
+    return dest_path
+
+
+def _is_url(src: str) -> bool:
+    return src.startswith(("http://", "https://"))
+
+
+def _fetch_url(url: str, dest: Path) -> None:
+    """Downloads src to dest via the system curl binary (same PATH
+    resolution udocker itself uses for its own downloads).
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(  # noqa: S603
+        ["curl", "-fsSL", "-o", str(dest), url],  # noqa: S607
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BuildError(f"ADD: failed to fetch {url}: {result.stderr.decode(errors='replace')}")
+
+
+def copy_instruction(op: str, args: str, root: Path, workdir: str, context_dir: Path) -> None:
+    """Executes COPY/ADD (no --from) against the given container ROOT.
+    ADD additionally auto-extracts tarballs and fetches URLs; COPY treats
+    every source as a plain file/directory copy.
+    """
+    sources, dest = _parse_copy_args(args)
+    dest_path = _resolve_dest_path(root, workdir, dest)
+
+    # Dest is a directory (not a rename target) when there are multiple
+    # sources or the Dockerfile dest ends in "/", matching real Docker.
+    dest_is_dir = len(sources) > 1 or dest.endswith("/")
+    if dest_is_dir:
+        dest_path.mkdir(parents=True, exist_ok=True)
+
+    for src in sources:
+        if op == "ADD" and _is_url(src):
+            target = dest_path / src.rsplit("/", 1)[-1] if dest_is_dir else dest_path
+            _fetch_url(src, target)
+            continue
+
+        src_path = _resolve_context_path(context_dir, src)
+        if not src_path.exists():
+            raise BuildError(f"{op} failed: no such file or directory: {src}")
+
+        if op == "ADD" and src_path.is_file() and tarfile.is_tarfile(src_path):
+            dest_path.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(src_path, mode="r:*") as tar:
+                tar.extractall(dest_path)  # noqa: S202 - context-local tar, escape already ruled out above
+            continue
+
+        target = dest_path / src_path.name if dest_is_dir else dest_path
+        if src_path.is_dir():
+            shutil.copytree(src_path, target, dirs_exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, target)
 
 
 def _shell_form_cmd(instruction_args: str) -> list[str]:
