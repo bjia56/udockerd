@@ -68,6 +68,100 @@ class Stage:
     instructions: list[Instruction] = field(default_factory=list)
 
 
+def _shell_form_cmd(instruction_args: str) -> list[str]:
+    """<shell-string> runs via /bin/sh -c, same as real Docker."""
+    return ["/bin/sh", "-c", instruction_args]
+
+
+def _exec_form_cmd(instruction_args: str) -> list[str] | None:
+    """["executable", "arg", ...] (JSON array) form. Returns None if
+    instruction_args isn't valid JSON array syntax, so callers fall back
+    to shell form.
+    """
+    stripped = instruction_args.strip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
+        return None
+    return list(parsed)
+
+
+@dataclass
+class StageConfig:
+    """Accumulates metadata-instruction state for one stage. Field names
+    match Docker's image config JSON `Config` section directly, so
+    commit_layer can pass this straight through with no translation.
+    """
+
+    Env: dict[str, str] = field(default_factory=dict)
+    WorkingDir: str = ""
+    User: str = ""
+    Cmd: list[str] | None = None
+    Entrypoint: list[str] | None = None
+    Labels: dict[str, str] = field(default_factory=dict)
+    ExposedPorts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    Volumes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    StopSignal: str = ""
+
+    def to_engine_opt(self) -> dict[str, Any]:
+        """Shape run_instruction's engine.opt expects (matches
+        container_proc.opt_from_request_body's key names).
+        """
+        opt: dict[str, Any] = {}
+        if self.Env:
+            opt["env"] = [f"{k}={v}" for k, v in self.Env.items()]
+        if self.WorkingDir:
+            opt["cwd"] = self.WorkingDir
+        if self.User:
+            opt["user"] = self.User
+        return opt
+
+
+def apply_metadata_instruction(op: str, args: str, config: StageConfig) -> None:
+    """Mutates config for one metadata-only instruction (ENV, WORKDIR,
+    USER, LABEL, CMD, ENTRYPOINT, EXPOSE, VOLUME, ARG, STOPSIGNAL). ARG is
+    a no-op here: its substitution effect already happened at parse time
+    (parse_dockerfile's env dict); it carries no image config.
+    """
+    if op == "ARG":
+        return
+    if op == "WORKDIR":
+        # Relative WORKDIR is relative to the previous one, like real Docker.
+        config.WorkingDir = args if args.startswith("/") else f"{config.WorkingDir}/{args}"
+    elif op == "USER":
+        config.User = args
+    elif op == "STOPSIGNAL":
+        config.StopSignal = args
+    elif op == "ENV":
+        if "=" in args.split(None, 1)[0]:
+            for pair in shlex.split(args):
+                key, _, value = pair.partition("=")
+                config.Env[key] = value
+        else:
+            key, _, value = args.partition(" ")
+            config.Env[key.strip()] = value.strip()
+    elif op == "LABEL":
+        for pair in shlex.split(args):
+            key, _, value = pair.partition("=")
+            config.Labels[key] = value
+    elif op == "EXPOSE":
+        for port in args.split():
+            spec = port if "/" in port else f"{port}/tcp"
+            config.ExposedPorts[spec] = {}
+    elif op == "VOLUME":
+        volumes = json.loads(args) if args.strip().startswith("[") else args.split()
+        for volume in volumes:
+            config.Volumes[volume] = {}
+    elif op == "CMD":
+        config.Cmd = _exec_form_cmd(args) or _shell_form_cmd(args)
+    elif op == "ENTRYPOINT":
+        config.Entrypoint = _exec_form_cmd(args) or _shell_form_cmd(args)
+
+
 def _strip_comment(line: str) -> str:
     """Only strips lines starting with #; inline # (e.g. "RUN echo '#'") stays."""
     if line.strip().startswith("#"):
@@ -357,28 +451,6 @@ def copy_instruction(
     finally:
         if from_container_id is not None:
             udocker_ctx.get().local.del_container(from_container_id, force=True)
-
-
-def _shell_form_cmd(instruction_args: str) -> list[str]:
-    """RUN <shell-string> runs via /bin/sh -c, same as real Docker."""
-    return ["/bin/sh", "-c", instruction_args]
-
-
-def _exec_form_cmd(instruction_args: str) -> list[str] | None:
-    """RUN ["executable", "arg", ...] (JSON array). Returns None if
-    instruction_args isn't valid JSON array syntax, so callers fall back
-    to shell form.
-    """
-    stripped = instruction_args.strip()
-    if not stripped.startswith("["):
-        return None
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
-        return None
-    return list(parsed)
 
 
 def run_instruction(
