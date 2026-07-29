@@ -10,8 +10,10 @@ import subprocess
 import tarfile
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from udocker.container.structure import ContainerStructure
 from udocker.engine.execmode import ExecutionMode
 
 from udockerd import udocker_ctx
@@ -19,7 +21,6 @@ from udockerd.container_proc import called_from_engine_run, original_popen, patc
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
 # Unsupported: no stdlib/proot equivalent, or BuildKit-only. Fail loudly
 # instead of silently no-opping.
@@ -200,30 +201,43 @@ def parse_dockerfile(text: str, buildargs: dict[str, str] | None = None) -> list
     return stages
 
 
-def _parse_copy_args(args: str) -> tuple[list[str], str]:
+def _parse_copy_args(args: str) -> tuple[list[str], str, str | None]:
     """COPY/ADD ["src", ..., "dest"] or whitespace-separated shell form.
-    --chown=/--chmod= flags are accepted and ignored (no uid mapping
-    under proot). Returns (sources, dest); last item is always dest.
+    --chown=/--chmod= are accepted and ignored (no uid mapping under
+    proot). Returns (sources, dest, from_stage); last item is always dest.
     """
     stripped = args.strip()
     if stripped.startswith("["):
         parsed = json.loads(stripped)
         if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
             raise ParseError(f"invalid COPY/ADD instruction: {args}")
-        tokens = list(parsed)
+        raw_tokens = list(parsed)
     else:
-        tokens = [t for t in shlex.split(stripped) if not t.startswith("--")]
+        raw_tokens = shlex.split(stripped)
+
+    from_stage = None
+    tokens = []
+    for token in raw_tokens:
+        if token.startswith("--from="):
+            from_stage = token.split("=", 1)[1]
+        elif token.startswith("--"):
+            continue
+        else:
+            tokens.append(token)
+
     if len(tokens) < 2:
         raise ParseError(f"COPY/ADD requires at least one source and a destination: {args}")
-    return tokens[:-1], tokens[-1]
+    return tokens[:-1], tokens[-1], from_stage
 
 
-def _resolve_context_path(context_dir: Path, src: str) -> Path:
-    """Resolves src against the build context, rejecting escapes."""
-    resolved = (context_dir / src).resolve()
-    context_resolved = context_dir.resolve()
-    if resolved != context_resolved and context_resolved not in resolved.parents:
-        raise BuildError(f"path outside build context: {src}")
+def _resolve_source_path(base_dir: Path, src: str) -> Path:
+    """Resolves src against base_dir (the build context, or a --from
+    stage/image ROOT), rejecting escapes.
+    """
+    resolved = (base_dir / src).resolve()
+    base_resolved = base_dir.resolve()
+    if resolved != base_resolved and base_resolved not in resolved.parents:
+        raise BuildError(f"path outside source root: {src}")
     return resolved
 
 
@@ -254,12 +268,44 @@ def _fetch_url(url: str, dest: Path) -> None:
         raise BuildError(f"ADD: failed to fetch {url}: {result.stderr.decode(errors='replace')}")
 
 
-def copy_instruction(op: str, args: str, root: Path, workdir: str, context_dir: Path) -> None:
-    """Executes COPY/ADD (no --from) against the given container ROOT.
-    ADD additionally auto-extracts tarballs and fetches URLs; COPY treats
-    every source as a plain file/directory copy.
+def _materialize_image_root(image_spec: str) -> tuple[Path, str]:
+    """COPY --from=<image> (not a prior stage): pulls/creates a throwaway
+    container from that image so its files can be host-copied. Returns
+    (root, container_id); caller must del_container(container_id) once done.
     """
-    sources, dest = _parse_copy_args(args)
+    if "@" in image_spec:
+        imagerepo, tag = image_spec.split("@", 1)
+    elif ":" in image_spec:
+        imagerepo, tag = image_spec.split(":", 1)
+    else:
+        imagerepo, tag = image_spec, "latest"
+
+    uctx = udocker_ctx.get()
+    if not uctx.local.cd_imagerepo(imagerepo, tag):
+        raise BuildError(f"COPY --from: no such image: {image_spec}")
+    container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
+    if not container_id:
+        raise BuildError(f"COPY --from: failed to materialize image: {image_spec}")
+    container_dir = uctx.local.cd_container(container_id)
+    return Path(container_dir) / "ROOT", container_id
+
+
+def copy_instruction(
+    op: str,
+    args: str,
+    root: Path,
+    workdir: str,
+    context_dir: Path,
+    stage_containers: dict[str, Path],
+) -> None:
+    """Executes COPY/ADD against the given container ROOT. --from=<name>
+    copies from a prior stage's ROOT (stage_containers, keyed by stage
+    name and stringified index); --from=<image> materializes a throwaway
+    container from that image first. Without --from, ADD additionally
+    auto-extracts tarballs and fetches URLs; COPY treats every source as
+    a plain file/directory copy.
+    """
+    sources, dest, from_stage = _parse_copy_args(args)
     dest_path = _resolve_dest_path(root, workdir, dest)
 
     # Dest is a directory (not a rename target) when there are multiple
@@ -268,28 +314,49 @@ def copy_instruction(op: str, args: str, root: Path, workdir: str, context_dir: 
     if dest_is_dir:
         dest_path.mkdir(parents=True, exist_ok=True)
 
-    for src in sources:
-        if op == "ADD" and _is_url(src):
-            target = dest_path / src.rsplit("/", 1)[-1] if dest_is_dir else dest_path
-            _fetch_url(src, target)
-            continue
+    from_root: Path | None = None
+    from_container_id: str | None = None
+    if from_stage is not None:
+        from_root = stage_containers.get(from_stage)
+        if from_root is None:
+            from_root, from_container_id = _materialize_image_root(from_stage)
 
-        src_path = _resolve_context_path(context_dir, src)
-        if not src_path.exists():
-            raise BuildError(f"{op} failed: no such file or directory: {src}")
+    try:
+        for src in sources:
+            if from_root is not None:
+                src_path = _resolve_source_path(from_root, src.lstrip("/"))
+                if not src_path.exists():
+                    raise BuildError(f"{op} failed: no such file or directory: {src}")
+            elif op == "ADD" and _is_url(src):
+                target = dest_path / src.rsplit("/", 1)[-1] if dest_is_dir else dest_path
+                _fetch_url(src, target)
+                continue
+            else:
+                src_path = _resolve_source_path(context_dir, src)
+                if not src_path.exists():
+                    raise BuildError(f"{op} failed: no such file or directory: {src}")
 
-        if op == "ADD" and src_path.is_file() and tarfile.is_tarfile(src_path):
-            dest_path.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(src_path, mode="r:*") as tar:
-                tar.extractall(dest_path)  # noqa: S202 - context-local tar, escape already ruled out above
-            continue
+            is_tar_add = (
+                from_root is None
+                and op == "ADD"
+                and src_path.is_file()
+                and tarfile.is_tarfile(src_path)
+            )
+            if is_tar_add:
+                dest_path.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(src_path, mode="r:*") as tar:
+                    tar.extractall(dest_path)  # noqa: S202 - context-local tar, escape already ruled out above
+                continue
 
-        target = dest_path / src_path.name if dest_is_dir else dest_path
-        if src_path.is_dir():
-            shutil.copytree(src_path, target, dirs_exist_ok=True)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, target)
+            target = dest_path / src_path.name if dest_is_dir else dest_path
+            if src_path.is_dir():
+                shutil.copytree(src_path, target, dirs_exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, target)
+    finally:
+        if from_container_id is not None:
+            udocker_ctx.get().local.del_container(from_container_id, force=True)
 
 
 def _shell_form_cmd(instruction_args: str) -> list[str]:
