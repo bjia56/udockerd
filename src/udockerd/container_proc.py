@@ -1,10 +1,13 @@
 """Spawns and tracks container processes via udocker's execution engines.
 
-engine.run() (PRootEngine, FakechrootEngine, ...) calls subprocess
-directly with no exposed Popen object, so we monkeypatch subprocess.Popen
-for the scope of that call to capture pid/pgid and prepend our process
-supervisor (supervisor.py/.c, needed since Cosmopolitan Python has no
-ctypes for PR_SET_PDEATHSIG).
+engine.run() calls subprocess directly with no exposed Popen object, so
+we monkeypatch subprocess.Popen for the scope of that call to capture
+pid/pgid and prepend our process supervisor (supervisor.py/.c, needed
+since Cosmopolitan Python has no ctypes for PR_SET_PDEATHSIG).
+
+patch_lock/original_popen/called_from_engine_run are shared with
+builder.py's RUN executor, which patches Popen the same way but without
+the supervisor or pid tracking.
 """
 
 from __future__ import annotations
@@ -27,16 +30,16 @@ from udockerd import supervisor, udocker_ctx
 if TYPE_CHECKING:
     from udocker.engine.base import ExecutionEngineCommon
 
-_patch_lock = threading.Lock()
-_original_popen = subprocess.Popen
+patch_lock = threading.Lock()
+original_popen = subprocess.Popen
 
-# udocker's own internal helpers (e.g. HostInfo.cmd_has_option) also call
-# subprocess.Popen during run(), before the real launch, so we check the
-# caller frame to only intercept the actual container-launch call.
+# udocker's own helpers (e.g. HostInfo.cmd_has_option) also call Popen
+# during run(), before the real launch; frame-check to only intercept
+# the actual container-launch call.
 _ENGINE_RUN_FILENAMES = ("engine/proot.py", "engine/fakechroot.py")
 
 
-def _called_from_engine_run() -> bool:
+def called_from_engine_run() -> bool:
     # 0=here, 1=_patched_popen, 2=subprocess.call, 3=engine.run
     frame = sys._getframe(3)
     filename = frame.f_code.co_filename.replace("\\", "/")
@@ -73,8 +76,8 @@ def _prepend_supervisor(args: Any, supervisor_path: str, tty_slave_path: str | N
 
 def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any) -> Any:
     def _patched_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        if not _called_from_engine_run():
-            return _original_popen(*args, **kwargs)  # noqa: S603
+        if not called_from_engine_run():
+            return original_popen(*args, **kwargs)  # noqa: S603
 
         # Release the lock (and unpatch) now: engine.run() is about to
         # block for the container's entire runtime inside Popen().wait(),
@@ -90,14 +93,14 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
             args = _prepend_supervisor(args, supervisor_path, tty_slave_path)
             # No stdin/stdout/stderr kwargs: supervisor.c's own dup2()
             # sequence makes the pty slave the controlling terminal.
-            popen_proc = _original_popen(*args, **kwargs)  # noqa: S603
+            popen_proc = original_popen(*args, **kwargs)  # noqa: S603
             spawn_tty_reader(proc, master_fd)
         else:
             args = _prepend_supervisor(args, supervisor_path, None)
             log_fh = open(proc.logfile, "ab")  # noqa: SIM115 - closed via Popen's fd ownership
             kwargs["stdout"] = log_fh
             kwargs["stderr"] = log_fh
-            popen_proc = _original_popen(*args, **kwargs)  # noqa: S603
+            popen_proc = original_popen(*args, **kwargs)  # noqa: S603
             log_fh.close()  # Popen dup'd the fd; safe to close our copy
         with proc.lock:
             proc.pid = popen_proc.pid
@@ -200,15 +203,21 @@ def opt_from_request_body(body: dict[str, Any]) -> dict[str, Any]:
 def _run_engine_patched(
     engine: ExecutionEngineCommon, container_id: str, proc: ContainerProc, supervisor_path: str
 ) -> int:
-    _patch_lock.acquire()
+    patch_lock.acquire()
     released = False
 
     def unpatch() -> None:
+        # Once released, some other caller may already hold the lock and
+        # have installed their own patched Popen; only the holder may
+        # touch the global, or a delayed second call here (e.g. this
+        # function's own finally, after Popen() already unpatched once)
+        # would stomp on that other caller's patch out from under it.
         nonlocal released
-        subprocess.Popen = _original_popen  # type: ignore[misc]
-        if not released:
-            released = True
-            _patch_lock.release()
+        if released:
+            return
+        released = True
+        subprocess.Popen = original_popen  # type: ignore[misc]
+        patch_lock.release()
 
     subprocess.Popen = _make_patched_popen(proc, supervisor_path, unpatch)  # type: ignore[misc]
     try:

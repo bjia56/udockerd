@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import queue
 import shlex
+import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from udocker.engine.execmode import ExecutionMode
+
+from udockerd import udocker_ctx
+from udockerd.container_proc import called_from_engine_run, original_popen, patch_lock
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -187,6 +196,109 @@ def parse_dockerfile(text: str, buildargs: dict[str, str] | None = None) -> list
         raise ParseError("Dockerfile has no FROM instruction")
 
     return stages
+
+
+def _shell_form_cmd(instruction_args: str) -> list[str]:
+    """RUN <shell-string> runs via /bin/sh -c, same as real Docker."""
+    return ["/bin/sh", "-c", instruction_args]
+
+
+def _exec_form_cmd(instruction_args: str) -> list[str] | None:
+    """RUN ["executable", "arg", ...] (JSON array). Returns None if
+    instruction_args isn't valid JSON array syntax, so callers fall back
+    to shell form.
+    """
+    stripped = instruction_args.strip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
+        return None
+    return list(parsed)
+
+
+def run_instruction(
+    instruction_args: str, container_id: str, opt: dict[str, Any]
+) -> Iterator[dict[str, Any]]:
+    """Executes RUN synchronously against the given (already-created)
+    scratch container, yielding {"stream": ...} lines as output arrives.
+    Raises BuildError on nonzero exit.
+    """
+    cmd = _exec_form_cmd(instruction_args) or _shell_form_cmd(instruction_args)
+
+    uctx = udocker_ctx.get()
+    exec_mode = ExecutionMode(uctx.local, container_id)
+    engine = exec_mode.get_engine()
+    engine.opt = dict(engine.opt)
+    engine.opt.setdefault("kernel", "")
+    engine.opt.setdefault("netcoop", False)
+    engine.opt.update(opt)
+    engine.opt["cmd"] = cmd
+
+    lines: queue.Queue[str] = queue.Queue()
+    reader_done = threading.Event()
+
+    def reader(pipe: Any) -> None:
+        for raw_line in iter(pipe.readline, b""):
+            lines.put(raw_line.decode("utf-8", errors="replace"))
+        pipe.close()
+        reader_done.set()
+
+    def make_patched_popen(unpatch: Any) -> Any:
+        def patched_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            if not called_from_engine_run():
+                return original_popen(*args, **kwargs)  # noqa: S603
+            unpatch()
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.STDOUT
+            popen_proc = original_popen(*args, **kwargs)  # noqa: S603
+            threading.Thread(target=reader, args=(popen_proc.stdout,), daemon=True).start()
+            return popen_proc
+
+        return patched_popen
+
+    exit_code_box: list[int] = []
+
+    def run_engine() -> None:
+        patch_lock.acquire()
+        released = False
+
+        def unpatch() -> None:
+            # Once released, another caller may already hold the lock
+            # with their own patched Popen installed; a stale second call
+            # here must not stomp on it.
+            nonlocal released
+            if released:
+                return
+            released = True
+            subprocess.Popen = original_popen  # type: ignore[misc]
+            patch_lock.release()
+
+        subprocess.Popen = make_patched_popen(unpatch)  # type: ignore[misc]
+        try:
+            exit_code_box.append(int(engine.run(container_id)))
+        finally:
+            unpatch()
+            # If run() failed before ever reaching Popen, no reader thread
+            # was ever started to set this.
+            reader_done.set()
+
+    engine_thread = threading.Thread(target=run_engine, daemon=True)
+    engine_thread.start()
+
+    while not reader_done.is_set() or not lines.empty():
+        try:
+            yield {"stream": lines.get(timeout=0.05)}
+        except queue.Empty:
+            continue
+
+    engine_thread.join()
+    exit_code = exit_code_box[0] if exit_code_box else 1
+    if exit_code != 0:
+        raise BuildError(f"The command '{' '.join(cmd)}' returned a non-zero code: {exit_code}")
 
 
 def build(
