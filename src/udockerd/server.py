@@ -4,7 +4,7 @@ from types import FrameType
 
 from udockerd import container_proc
 from udockerd.http import Router, ThreadingHTTPServer, make_handler_class
-from udockerd.routes import containers, images, system
+from udockerd.routes import build, containers, images, system
 from udockerd.routes import exec as exec_routes
 
 
@@ -14,6 +14,7 @@ def build_router() -> Router:
     images.register(router)
     containers.register(router)
     exec_routes.register(router)
+    build.register(router)
     return router
 
 

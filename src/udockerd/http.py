@@ -62,11 +62,15 @@ class RequestContext:
     def path(self) -> str:
         return self._handler.path
 
-    def read_json(self) -> Any:
+    def read_body(self) -> bytes:
+        """Raw request body, e.g. a build context tar."""
         length = int(self._handler.headers.get("Content-Length", 0) or 0)
         if not length:
-            return None
-        body = self._handler.rfile.read(length)
+            return b""
+        return self._handler.rfile.read(length)
+
+    def read_json(self) -> Any:
+        body = self.read_body()
         return json.loads(body) if body else None
 
     def send_json(self, status: int, payload: Any) -> None:

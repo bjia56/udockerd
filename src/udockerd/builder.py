@@ -1,21 +1,20 @@
-"""Classic `docker build` implementation: Dockerfile parsing and stage
-execution. See docs/DESIGN.md's Build section for the full design
-rationale (why classic builder not BuildKit, one flattened layer per
-build, etc).
-"""
+"""Classic `docker build`: Dockerfile parsing and stage execution."""
 
 from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-# Instructions with no pure-stdlib/proot-compatible equivalent, or that are
-# BuildKit-only; failing loudly beats silently no-opping.
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
+# Unsupported: no stdlib/proot equivalent, or BuildKit-only. Fail loudly
+# instead of silently no-opping.
 _UNSUPPORTED_INSTRUCTIONS = frozenset({"HEALTHCHECK", "ONBUILD", "SHELL"})
 
-# Metadata-only instructions: recorded into the stage's config but not
-# executed against the filesystem (no real network namespace or volumes
-# object, consistent with the rest of udockerd's scope).
+# Metadata-only: recorded into stage config, not executed against the filesystem.
 _METADATA_INSTRUCTIONS = frozenset(
     {
         "ENV",
@@ -35,23 +34,18 @@ _KNOWN_INSTRUCTIONS = _METADATA_INSTRUCTIONS | {"FROM", "RUN", "COPY", "ADD"}
 
 
 class ParseError(Exception):
-    """Raised for malformed or unsupported Dockerfile content; caught by
-    routes/build.py and surfaced as a Docker-API-shaped {"error": ...} line.
-    """
+    """Malformed or unsupported Dockerfile content."""
 
 
 class BuildError(Exception):
-    """Raised when a build step fails (nonzero RUN exit, missing COPY
-    source, etc). Message shape matches real docker's own errors where
-    docker-py/CLI pattern-match on them.
-    """
+    """A build step failed (nonzero RUN exit, missing COPY source, etc)."""
 
 
 @dataclass
 class Instruction:
     op: str
     args: str
-    raw: str  # original (post-substitution) line, for Step N/M display
+    raw: str  # post-substitution line, for Step N/M display
 
 
 @dataclass
@@ -63,18 +57,14 @@ class Stage:
 
 
 def _strip_comment(line: str) -> str:
-    """# comments only when # starts the (stripped) line; Dockerfile syntax
-    has no inline-comment support, so "RUN echo '#'" is left untouched.
-    """
+    """Only strips lines starting with #; inline # (e.g. "RUN echo '#'") stays."""
     if line.strip().startswith("#"):
         return ""
     return line
 
 
 def _join_continuations(text: str) -> list[str]:
-    """Joins trailing-backslash line continuations into single logical
-    lines, dropping blank/comment-only lines.
-    """
+    """Joins trailing-backslash continuations into logical lines."""
     raw_lines = text.splitlines()
     logical_lines: list[str] = []
     buffer = ""
@@ -96,9 +86,8 @@ def _join_continuations(text: str) -> list[str]:
 
 
 def _substitute(line: str, env: dict[str, str]) -> str:
-    """Expands $VAR and ${VAR} using the ARG/ENV values accumulated so far
-    in the current stage. Unknown vars are left as empty string, matching
-    Dockerfile semantics for unset ARGs with no default.
+    """Expands $VAR / ${VAR} from ARG/ENV values seen so far in the stage.
+    Unknown vars expand to empty string.
     """
     result = []
     i = 0
@@ -151,10 +140,8 @@ def _parse_from_args(args: str) -> tuple[str, str, str | None]:
 
 
 def parse_dockerfile(text: str, buildargs: dict[str, str] | None = None) -> list[Stage]:
-    """Single-pass Dockerfile parser producing a per-stage instruction
-    list. ARG/ENV substitution is tracked per-stage (real Dockerfile scoping
-    resets ARG at each FROM); buildargs seeds ARG values for stages that
-    declare them.
+    """Single-pass parse into a per-stage instruction list. ARG/ENV state
+    resets at each FROM; buildargs seeds ARG values.
     """
     buildargs = buildargs or {}
     stages: list[Stage] = []
@@ -200,3 +187,16 @@ def parse_dockerfile(text: str, buildargs: dict[str, str] | None = None) -> list
         raise ParseError("Dockerfile has no FROM instruction")
 
     return stages
+
+
+def build(
+    *,
+    context_dir: Path,
+    dockerfile_path: Path,
+    tags: list[str],
+    buildargs: dict[str, str],
+    labels: dict[str, str],
+    target: str | None,
+) -> Iterator[dict[str, Any]]:
+    """Runs every stage, yields Docker-API-shaped JSON-lines progress dicts."""
+    raise NotImplementedError
