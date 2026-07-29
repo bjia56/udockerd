@@ -28,30 +28,6 @@ def _query(ctx: RequestContext) -> dict[str, list[str]]:
     return parse_qs(urlsplit(ctx.path).query)
 
 
-def _split_imagespec(imagespec: str) -> tuple[str, str]:
-    if "@" in imagespec:
-        imagerepo, tag = imagespec.split("@", 1)
-    elif ":" in imagespec:
-        imagerepo, tag = imagespec.split(":", 1)
-    else:
-        imagerepo, tag = imagespec, "latest"
-    return imagerepo, tag
-
-
-def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
-    """Same short-name resolution as routes/images.py, kept local: this
-    call site only checks existence, not manifest details.
-    """
-    uctx = udocker_ctx.get()
-    if uctx.local.cd_imagerepo(imagerepo, tag):
-        return imagerepo, tag
-    _, remoterepo = uctx.dockerioapi._parse_imagerepo(imagerepo)  # noqa: SLF001
-    for candidate in (remoterepo, f"docker.io/{remoterepo}"):
-        if candidate != imagerepo and uctx.local.cd_imagerepo(candidate, tag):
-            return candidate, tag
-    return None
-
-
 def _summary(proc: ContainerProc) -> dict[str, Any]:
     return {
         "Id": proc.container_id,
@@ -132,10 +108,10 @@ def create(ctx: RequestContext) -> None:
         ctx.send_json(400, {"message": "Image is required"})
         return
 
-    imagerepo, tag = _split_imagespec(image)
+    imagerepo, tag = udocker_ctx.split_imagespec(image)
     uctx = udocker_ctx.get()
     with uctx.lock:
-        resolved = _resolve_imagerepo(imagerepo, tag)
+        resolved = udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
         if resolved is None:
             ctx.send_json(404, {"message": f"No such image: {image}"})
             return

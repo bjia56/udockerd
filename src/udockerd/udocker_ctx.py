@@ -59,3 +59,28 @@ def get() -> UdockerContext:
     if _context is None:
         raise RuntimeError("udocker context not initialized; call udocker_ctx.init() first")
     return _context
+
+
+def split_imagespec(imagespec: str) -> tuple[str, str]:
+    if "@" in imagespec:
+        imagerepo, tag = imagespec.split("@", 1)
+    elif ":" in imagespec:
+        imagerepo, tag = imagespec.split(":", 1)
+    else:
+        imagerepo, tag = imagespec, "latest"
+    return imagerepo, tag
+
+
+def resolve_imagerepo(uctx: UdockerContext, imagerepo: str, tag: str) -> tuple[str, str] | None:
+    """Images are stored under a qualified path (docker.io/library/alpine)
+    but clients ask for the short name; reuses DockerIoAPI's own
+    name-qualification logic.
+    """
+    if uctx.local.cd_imagerepo(imagerepo, tag):
+        return imagerepo, tag
+
+    _, remoterepo = uctx.dockerioapi._parse_imagerepo(imagerepo)  # noqa: SLF001
+    for candidate in (remoterepo, f"docker.io/{remoterepo}"):
+        if candidate != imagerepo and uctx.local.cd_imagerepo(candidate, tag):
+            return candidate, tag
+    return None

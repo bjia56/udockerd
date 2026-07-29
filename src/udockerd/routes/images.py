@@ -39,46 +39,20 @@ def _synthetic_id(imagerepo: str, tag: str) -> str:
     return f"sha256:{digest}"
 
 
-def _split_imagespec(imagespec: str) -> tuple[str, str]:
-    if "@" in imagespec:
-        imagerepo, tag = imagespec.split("@", 1)
-    elif ":" in imagespec:
-        imagerepo, tag = imagespec.split(":", 1)
-    else:
-        imagerepo, tag = imagespec, "latest"
-    return imagerepo, tag
-
-
-def _resolve_imagerepo(imagerepo: str, tag: str) -> tuple[str, str] | None:
-    """Images are stored under a qualified path (docker.io/library/alpine)
-    but clients ask for the short name; reuses DockerIoAPI's own
-    name-qualification logic.
-    """
-    uctx = udocker_ctx.get()
-    if uctx.local.cd_imagerepo(imagerepo, tag):
-        return imagerepo, tag
-
-    _, remoterepo = uctx.dockerioapi._parse_imagerepo(imagerepo)  # noqa: SLF001
-    for candidate in (remoterepo, f"docker.io/{remoterepo}"):
-        if candidate != imagerepo and uctx.local.cd_imagerepo(candidate, tag):
-            return candidate, tag
-    return None
-
-
 def _resolve_by_name_or_id(name: str) -> tuple[str, str] | None:
     """Resolves a repo:tag/short name or a bare sha256:... digest id.
     Needed since client.images.list() inspects by digest id, not name.
     """
+    uctx = udocker_ctx.get()
     if name.startswith("sha256:"):
-        uctx = udocker_ctx.get()
         for imagerepo, tag in uctx.local.get_imagerepos():
             info = _manifest_info(imagerepo, tag)
             candidate_id = info["id"] if info else _synthetic_id(imagerepo, tag)
             if candidate_id == name:
                 return imagerepo, tag
         return None
-    imagerepo, tag = _split_imagespec(name)
-    return _resolve_imagerepo(imagerepo, tag)
+    imagerepo, tag = udocker_ctx.split_imagespec(name)
+    return udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
 
 
 def _created_timestamp(image_json: dict[str, Any] | None) -> int:

@@ -367,16 +367,12 @@ def _materialize_image_root(image_spec: str) -> tuple[Path, str]:
     container from that image so its files can be host-copied. Returns
     (root, container_id); caller must del_container(container_id) once done.
     """
-    if "@" in image_spec:
-        imagerepo, tag = image_spec.split("@", 1)
-    elif ":" in image_spec:
-        imagerepo, tag = image_spec.split(":", 1)
-    else:
-        imagerepo, tag = image_spec, "latest"
-
     uctx = udocker_ctx.get()
-    if not uctx.local.cd_imagerepo(imagerepo, tag):
+    imagerepo, tag = udocker_ctx.split_imagespec(image_spec)
+    resolved = udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
+    if resolved is None:
         raise BuildError(f"COPY --from: no such image: {image_spec}")
+    imagerepo, tag = resolved
     container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
     if not container_id:
         raise BuildError(f"COPY --from: failed to materialize image: {image_spec}")
@@ -534,6 +530,21 @@ def run_instruction(
         raise BuildError(f"The command '{' '.join(cmd)}' returned a non-zero code: {exit_code}")
 
 
+def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str:
+    """Flattens the given container's ROOT into a single image layer,
+    synthesizes a v2-schema2 manifest + config, and registers each tag.
+    Returns the image id.
+    """
+    raise NotImplementedError
+
+
+def _find_target_index(stages: list[Stage], target: str) -> int:
+    for i, stage in enumerate(stages):
+        if stage.name == target:
+            return i
+    raise BuildError(f"target stage {target!r} could not be found")
+
+
 def build(
     *,
     context_dir: Path,
@@ -543,5 +554,80 @@ def build(
     labels: dict[str, str],
     target: str | None,
 ) -> Iterator[dict[str, Any]]:
-    """Runs every stage, yields Docker-API-shaped JSON-lines progress dicts."""
-    raise NotImplementedError
+    """Runs every stage in order, yielding Docker-API-shaped JSON-lines
+    progress dicts. The last stage run (the whole file, or up to --target)
+    gets committed as the final image; earlier stages are scratch space
+    for COPY --from and deleted once the build finishes.
+    """
+    stages = parse_dockerfile(dockerfile_path.read_text(), buildargs)
+    last_index = len(stages) - 1 if target is None else _find_target_index(stages, target)
+    active_stages = stages[: last_index + 1]
+
+    total_steps = sum(1 + len(stage.instructions) for stage in active_stages)
+    step = 0
+
+    uctx = udocker_ctx.get()
+    stage_containers: dict[str, Path] = {}
+    stage_container_ids: list[str] = []
+    final_container_id = ""
+    final_config = StageConfig()
+
+    try:
+        for i, stage in enumerate(active_stages):
+            step += 1
+            base_spec = f"{stage.base_image}:{stage.base_tag}"
+            yield {"stream": f"Step {step}/{total_steps} : FROM {base_spec}\n"}
+
+            with uctx.lock:
+                resolved = udocker_ctx.resolve_imagerepo(uctx, stage.base_image, stage.base_tag)
+                if resolved is None:
+                    raise BuildError(f"no such image: {base_spec}")
+                imagerepo, tag = resolved
+                container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
+            if not container_id:
+                raise BuildError(f"failed to create build stage from {stage.base_image}")
+
+            stage_container_ids.append(container_id)
+            container_dir = Path(uctx.local.cd_container(container_id))
+            root = container_dir / "ROOT"
+
+            config = StageConfig()
+            for instruction in stage.instructions:
+                step += 1
+                yield {"stream": f"Step {step}/{total_steps} : {instruction.raw}\n"}
+
+                if instruction.op == "RUN":
+                    opt = config.to_engine_opt()
+                    yield from run_instruction(instruction.args, container_id, opt)
+                elif instruction.op in ("COPY", "ADD"):
+                    copy_instruction(
+                        instruction.op,
+                        instruction.args,
+                        root,
+                        config.WorkingDir,
+                        context_dir,
+                        stage_containers,
+                    )
+                else:
+                    apply_metadata_instruction(instruction.op, instruction.args, config)
+
+            if stage.name is not None:
+                stage_containers[stage.name] = root
+            stage_containers[str(i)] = root
+
+            if i == last_index:
+                final_container_id = container_id
+                final_config = config
+
+        final_config.Labels.update(labels)
+        image_id = commit_layer(final_container_id, final_config, tags)
+        yield {"stream": f"Successfully built {image_id[:12]}\n"}
+        for tag_spec in tags:
+            yield {"stream": f"Successfully tagged {tag_spec}\n"}
+    finally:
+        # All build containers are scratch space: once commit_layer has
+        # tarred the final one's ROOT into the image layer (or the build
+        # failed), none of them need to stick around.
+        with uctx.lock:
+            for container_id in stage_container_ids:
+                uctx.local.del_container(container_id, force=True)
