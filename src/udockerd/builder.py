@@ -422,11 +422,16 @@ def _materialize_image_root(image_spec: str) -> tuple[Path, str]:
     """
     uctx = udocker_ctx.get()
     imagerepo, tag = udocker_ctx.split_imagespec(image_spec)
-    resolved = udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
-    if resolved is None:
-        raise BuildError(f"COPY --from: no such image: {image_spec}")
-    imagerepo, tag = resolved
-    container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
+    # resolve_imagerepo/create_fromimage are multi-step sequences over
+    # LocalRepository's unsynchronized cur_repodir/cur_tagdir cursor
+    # state; must hold the lock for their full span or a concurrent
+    # pull/build/container-create can repoint the cursor mid-sequence.
+    with uctx.lock:
+        resolved = udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
+        if resolved is None:
+            raise BuildError(f"COPY --from: no such image: {image_spec}")
+        imagerepo, tag = resolved
+        container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
     if not container_id:
         raise BuildError(f"COPY --from: failed to materialize image: {image_spec}")
     container_dir = uctx.local.cd_container(container_id)
@@ -643,18 +648,24 @@ def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str
         if not tags:
             tags = [f"udockerd-build:{config_digest.split(':', 1)[1][:12]}"]
 
-        for tag_spec in tags:
-            imagerepo, tag = udocker_ctx.split_imagespec(tag_spec)
-            uctx.local.setup_imagerepo(imagerepo)
-            if not (uctx.local.setup_tag(tag) and uctx.local.set_version("v2")):
-                raise BuildError(f"failed to register tag: {tag_spec}")
-            uctx.local.save_json(config_digest, config_json)
-            uctx.local.save_json("manifest", manifest)
+        # setup_imagerepo/setup_tag/set_version/save_json/add_image_layer
+        # all read or write LocalRepository's unsynchronized
+        # cur_repodir/cur_tagdir cursor; a concurrent pull/build/
+        # container-create repointing it mid-loop would misdirect this
+        # tag's manifest/config/layer into the wrong image directory.
+        with uctx.lock:
+            for tag_spec in tags:
+                imagerepo, tag = udocker_ctx.split_imagespec(tag_spec)
+                uctx.local.setup_imagerepo(imagerepo)
+                if not (uctx.local.setup_tag(tag) and uctx.local.set_version("v2")):
+                    raise BuildError(f"failed to register tag: {tag_spec}")
+                uctx.local.save_json(config_digest, config_json)
+                uctx.local.save_json("manifest", manifest)
 
-            layer_dest = Path(uctx.local.layersdir) / layer_digest
-            if not layer_dest.exists():
-                shutil.copy2(layer_tar, layer_dest)
-            uctx.local.add_image_layer(str(layer_dest))
+                layer_dest = Path(uctx.local.layersdir) / layer_digest
+                if not layer_dest.exists():
+                    shutil.copy2(layer_tar, layer_dest)
+                uctx.local.add_image_layer(str(layer_dest))
 
     return config_digest
 
