@@ -12,6 +12,7 @@ permission error building udockerd's own wheel.
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,7 @@ def docker_available() -> bool:
 
 
 @pytest.fixture(scope="session")
-def harness_port():
+def harness_port() -> Iterator[int]:
     """Yields the host port udockerd is listening on inside the harness
     container. Session-scoped; tests clean up their own containers/images.
     """

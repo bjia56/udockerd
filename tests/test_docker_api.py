@@ -6,6 +6,7 @@ creates so the shared session-scoped harness stays usable across tests.
 
 import subprocess
 import time
+from collections.abc import Iterator
 
 import docker
 import pytest
@@ -14,14 +15,14 @@ IMAGE = "alpine:latest"
 
 
 @pytest.fixture
-def client(harness_port):
+def client(harness_port: int) -> Iterator[docker.DockerClient]:
     c = docker.DockerClient(base_url=f"tcp://127.0.0.1:{harness_port}")
     yield c
     c.close()
 
 
 @pytest.fixture(scope="session", autouse=True)
-def pulled_image(harness_port):
+def pulled_image(harness_port: int) -> None:
     """Pulls once per session; re-pulling per test would dominate runtime."""
     client = docker.DockerClient(base_url=f"tcp://127.0.0.1:{harness_port}")
     client.images.pull(IMAGE)
@@ -32,18 +33,18 @@ def _unique_name(prefix: str) -> str:
     return f"{prefix}-{int(time.time() * 1000)}"
 
 
-def test_image_pull_and_list(client):
+def test_image_pull_and_list(client: docker.DockerClient) -> None:
     images = client.images.list()
     assert any(IMAGE in (img.tags or []) for img in images)
 
 
-def test_image_inspect(client):
+def test_image_inspect(client: docker.DockerClient) -> None:
     image = client.images.get(IMAGE)
     assert image.attrs["Id"].startswith("sha256:")
     assert image.attrs["Architecture"]
 
 
-def test_container_lifecycle(client):
+def test_container_lifecycle(client: docker.DockerClient) -> None:
     name = _unique_name("lifecycle")
     container = client.containers.create(IMAGE, command=["sleep", "30"], name=name)
     assert container.status == "created"
@@ -63,7 +64,7 @@ def test_container_lifecycle(client):
     assert not any(c.name == name for c in client.containers.list(all=True))
 
 
-def test_container_logs(client):
+def test_container_logs(client: docker.DockerClient) -> None:
     name = _unique_name("logs")
     container = client.containers.run(
         IMAGE, command=["sh", "-c", "echo hello; echo world"], name=name, detach=True
@@ -75,7 +76,7 @@ def test_container_logs(client):
     container.remove()
 
 
-def test_container_logs_follow_terminates(client):
+def test_container_logs_follow_terminates(client: docker.DockerClient) -> None:
     name = _unique_name("logsfollow")
     container = client.containers.run(
         IMAGE, command=["sh", "-c", "echo one; sleep 1; echo two"], name=name, detach=True
@@ -91,7 +92,7 @@ def test_container_logs_follow_terminates(client):
     container.remove()
 
 
-def test_container_wait(client):
+def test_container_wait(client: docker.DockerClient) -> None:
     name = _unique_name("wait")
     container = client.containers.run(IMAGE, command=["sh", "-c", "exit 3"], name=name, detach=True)
     result = container.wait()
@@ -99,7 +100,7 @@ def test_container_wait(client):
     container.remove()
 
 
-def test_container_exec(client):
+def test_container_exec(client: docker.DockerClient) -> None:
     name = _unique_name("exec")
     container = client.containers.run(IMAGE, command=["sleep", "30"], name=name, detach=True)
     exit_code, output = container.exec_run(["echo", "exec output"])
@@ -109,7 +110,7 @@ def test_container_exec(client):
     container.remove()
 
 
-def test_container_exec_survives_after_container_running(client):
+def test_container_exec_survives_after_container_running(client: docker.DockerClient) -> None:
     """Regression guard: exec into a running container used to hang on
     the shared subprocess.Popen patch lock.
     """
@@ -125,7 +126,7 @@ def test_container_exec_survives_after_container_running(client):
     container.remove()
 
 
-def test_container_kill(client):
+def test_container_kill(client: docker.DockerClient) -> None:
     name = _unique_name("kill")
     container = client.containers.run(IMAGE, command=["sleep", "30"], name=name, detach=True)
     container.kill()
@@ -134,7 +135,7 @@ def test_container_kill(client):
     container.remove()
 
 
-def test_container_network_settings_shape(client):
+def test_container_network_settings_shape(client: docker.DockerClient) -> None:
     """Guards the NetworkSettings.Networks nested-map shape (not a flat
     IPAddress field).
     """
@@ -148,7 +149,7 @@ def test_container_network_settings_shape(client):
     container.remove()
 
 
-def test_docker_run_detached_does_not_hang(harness_port):
+def test_docker_run_detached_does_not_hang(harness_port: int) -> None:
     """Regression guard: docker run -d calls ContainerWait (blocks on
     response headers) before ContainerStart; /wait must send headers
     before the container exits.
@@ -173,7 +174,7 @@ def test_docker_run_detached_does_not_hang(harness_port):
     )
 
 
-def test_docker_run_foreground_attaches(harness_port):
+def test_docker_run_foreground_attaches(harness_port: int) -> None:
     """Regression guard: attach can connect before /start creates the logfile."""
     result = subprocess.run(
         ["docker", "run", "--rm", IMAGE, "echo", "attach output"],

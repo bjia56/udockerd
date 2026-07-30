@@ -23,6 +23,7 @@ udockerd = "udockerd.__main__:main"
 dev = [
     "pytest>=8",
     "docker>=7",
+    "types-docker",
     "mypy>=1.19",
     "ruff>=0.15",
 ]
@@ -47,7 +48,7 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["udockerd"]
+files = ["src", "tests"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]

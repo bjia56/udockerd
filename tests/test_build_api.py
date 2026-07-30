@@ -3,6 +3,8 @@ real docker SDK against the test harness.
 """
 
 import time
+from collections.abc import Iterator
+from pathlib import Path
 
 import docker
 import docker.errors
@@ -12,14 +14,14 @@ IMAGE = "alpine:latest"
 
 
 @pytest.fixture
-def client(harness_port):
+def client(harness_port: int) -> Iterator[docker.DockerClient]:
     c = docker.DockerClient(base_url=f"tcp://127.0.0.1:{harness_port}")
     yield c
     c.close()
 
 
 @pytest.fixture(scope="session", autouse=True)
-def pulled_image(harness_port):
+def pulled_image(harness_port: int) -> None:
     """Build stages FROM this image; pytest fixtures don't share across
     test files, so this mirrors test_docker_api.py's own pull fixture.
     """
@@ -32,12 +34,12 @@ def _unique_tag(prefix: str) -> str:
     return f"{prefix}-{int(time.time() * 1000)}:test"
 
 
-def _write_dockerfile(tmp_path, content):
+def _write_dockerfile(tmp_path: Path, content: str) -> Path:
     (tmp_path / "Dockerfile").write_text(content)
     return tmp_path
 
 
-def test_build_single_stage(client, tmp_path):
+def test_build_single_stage(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-single")
     context = _write_dockerfile(
         tmp_path,
@@ -54,7 +56,7 @@ def test_build_single_stage(client, tmp_path):
     assert output.strip() == b"building"
 
 
-def test_build_copy_from_context(client, tmp_path):
+def test_build_copy_from_context(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-copy")
     (tmp_path / "app.txt").write_text("hello from context")
     _write_dockerfile(
@@ -70,7 +72,7 @@ def test_build_copy_from_context(client, tmp_path):
     assert output == b"hello from context"
 
 
-def test_build_multi_stage_copy_from(client, tmp_path):
+def test_build_multi_stage_copy_from(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-multistage")
     context = _write_dockerfile(
         tmp_path,
@@ -88,7 +90,7 @@ def test_build_multi_stage_copy_from(client, tmp_path):
     assert output.strip() == b"from-builder"
 
 
-def test_build_buildargs(client, tmp_path):
+def test_build_buildargs(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-args")
     context = _write_dockerfile(
         tmp_path,
@@ -106,7 +108,7 @@ def test_build_buildargs(client, tmp_path):
     assert output.strip() == b"hi-from-arg"
 
 
-def test_build_target_stops_at_stage(client, tmp_path):
+def test_build_target_stops_at_stage(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-target")
     context = _write_dockerfile(
         tmp_path,
@@ -123,7 +125,7 @@ def test_build_target_stops_at_stage(client, tmp_path):
     assert output.strip() == b"builder-stage"
 
 
-def test_build_run_failure_reports_error(client, tmp_path):
+def test_build_run_failure_reports_error(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-fail")
     context = _write_dockerfile(
         tmp_path,
@@ -139,7 +141,7 @@ def test_build_run_failure_reports_error(client, tmp_path):
         client.images.get(tag)
 
 
-def test_build_unsupported_instruction_fails(client, tmp_path):
+def test_build_unsupported_instruction_fails(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-unsupported")
     context = _write_dockerfile(
         tmp_path,

@@ -5,7 +5,7 @@ the real `docker` CLI over DOCKER_HOST.
 import subprocess
 
 
-def test_docker_cli_version(harness_port):
+def test_docker_cli_version(harness_port: int) -> None:
     result = subprocess.run(
         ["docker", "version"],
         env={"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"},
@@ -16,7 +16,7 @@ def test_docker_cli_version(harness_port):
     assert "udockerd" in result.stdout
 
 
-def test_ping(harness_port):
+def test_ping(harness_port: int) -> None:
     result = subprocess.run(
         [
             "curl", "-sf", "-o", "/dev/null", "-w", "%{http_code}",
