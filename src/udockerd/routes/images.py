@@ -39,18 +39,35 @@ def _synthetic_id(imagerepo: str, tag: str) -> str:
     return f"sha256:{digest}"
 
 
+def _is_hex_id(name: str) -> bool:
+    """True for a bare digest id (full sha256:... or a short hex prefix,
+    e.g. what docker-py's images.build() parses out of "Successfully
+    built <12hex>" and then inspects by).
+    """
+    digest = name.split(":", 1)[1] if name.startswith("sha256:") else name
+    return bool(digest) and all(c in "0123456789abcdef" for c in digest)
+
+
+def _resolve_by_digest_prefix(
+    uctx: udocker_ctx.UdockerContext, digest: str
+) -> tuple[str, str] | None:
+    for imagerepo, tag in uctx.local.get_imagerepos():
+        info = _manifest_info(imagerepo, tag)
+        candidate_id = info["id"] if info else _synthetic_id(imagerepo, tag)
+        if candidate_id.split(":", 1)[1].startswith(digest):
+            return imagerepo, tag
+    return None
+
+
 def _resolve_by_name_or_id(name: str) -> tuple[str, str] | None:
-    """Resolves a repo:tag/short name or a bare sha256:... digest id.
-    Needed since client.images.list() inspects by digest id, not name.
+    """Resolves a repo:tag/short name, a full sha256:... digest, or a
+    short hex id prefix (docker-py's images.build() inspects the built
+    image by the short id parsed from the build's success message).
     """
     uctx = udocker_ctx.get()
-    if name.startswith("sha256:"):
-        for imagerepo, tag in uctx.local.get_imagerepos():
-            info = _manifest_info(imagerepo, tag)
-            candidate_id = info["id"] if info else _synthetic_id(imagerepo, tag)
-            if candidate_id == name:
-                return imagerepo, tag
-        return None
+    if _is_hex_id(name):
+        digest = name.split(":", 1)[1] if name.startswith("sha256:") else name
+        return _resolve_by_digest_prefix(uctx, digest)
     imagerepo, tag = udocker_ctx.split_imagespec(name)
     return udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
 

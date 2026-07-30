@@ -68,6 +68,12 @@ def _inspect_json(proc: ContainerProc) -> dict[str, Any]:
             "AttachStderr": True,
             "OpenStdin": proc.tty,
         },
+        "HostConfig": {
+            # Matches how logs are actually stored here (per-container
+            # logfile, not a driver plugin); docker-py's containers.run()
+            # reads this to decide how to fetch non-detached run() output.
+            "LogConfig": {"Type": "json-file", "Config": {}},
+        },
         "NetworkSettings": _network_settings(),
     }
 
@@ -99,6 +105,18 @@ def _network_settings() -> dict[str, Any]:
     }
 
 
+def _opt_from_image_config(uctx: udocker_ctx.UdockerContext) -> dict[str, Any]:
+    """Image config defaults (Cmd/Entrypoint/Env/WorkingDir/User) for a
+    container that doesn't override them at create time — same fields
+    opt_from_request_body reads from the request body, but from the
+    image itself via get_image_attributes() (must be called right after
+    cd_imagerepo/create_fromimage, which set the current tag dir).
+    """
+    image_json, _ = uctx.local.get_image_attributes()
+    config = (image_json or {}).get("config", {}) or {}
+    return container_proc.opt_from_request_body(config)
+
+
 def create(ctx: RequestContext) -> None:
     query = _query(ctx)
     name = query.get("name", [""])[0]
@@ -119,18 +137,20 @@ def create(ctx: RequestContext) -> None:
         container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
         if name:
             uctx.local.set_container_name(container_id, name)
+        image_opt = _opt_from_image_config(uctx)
 
     if not container_id:
         ctx.send_json(500, {"message": "container creation failed"})
         return
 
     display_name = name or container_id
+    opt = {**image_opt, **container_proc.opt_from_request_body(body)}
     proc = container_proc.ContainerProc(
         container_id=container_id,
         name=display_name,
         image=image,
         logfile=str(_LOG_DIR / f"{container_id}.log"),
-        opt=container_proc.opt_from_request_body(body),
+        opt=opt,
         tty=bool(body.get("Tty")),
     )
     container_proc.registry.add(proc)

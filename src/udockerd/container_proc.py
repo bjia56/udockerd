@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from udocker.engine.execmode import ExecutionMode
+from udocker.utils.uenv import Uenv
 
 from udockerd import supervisor, udocker_ctx
 
@@ -54,13 +55,30 @@ _EXTRA_OPT_DEFAULTS: dict[str, Any] = {
 }
 
 
-def _apply_default_opt(engine: ExecutionEngineCommon) -> None:
+def apply_default_opt(engine: ExecutionEngineCommon) -> None:
     # ExecutionEngineCommon.opt is a class-level mutable dict shared by
     # every engine instance; copy before mutating or state leaks across
-    # unrelated containers.
+    # unrelated containers. opt["env"] is a Uenv object, not a plain
+    # value, so the dict-level copy alone would still leave every
+    # engine sharing (and mutating) the same Uenv instance.
     engine.opt = dict(engine.opt)
+    engine.opt["env"] = Uenv(engine.opt["env"].list())
     for key, default in _EXTRA_OPT_DEFAULTS.items():
         engine.opt.setdefault(key, default)
+
+
+def apply_engine_opt(engine: ExecutionEngineCommon, opt: dict[str, Any]) -> None:
+    """Merges a plain opt dict (opt_from_request_body's shape) into
+    engine.opt, without mutating opt itself. opt["env"], if present, is
+    a list[str] and must be merged into the existing Uenv rather than
+    overwrite it — udocker's engine.run() calls Uenv-only methods
+    (extendif, etc) on opt["env"]. Shared by container_proc.spawn() and
+    builder.run_instruction().
+    """
+    engine.opt.update({k: v for k, v in opt.items() if k != "env"})
+    env = opt.get("env")
+    if env:
+        engine.opt["env"].extend(env)
 
 
 def _prepend_supervisor(args: Any, supervisor_path: str, tty_slave_path: str | None) -> Any:
@@ -242,8 +260,8 @@ def spawn(proc: ContainerProc) -> None:
     def target() -> None:
         exec_mode = ExecutionMode(uctx.local, container_id)
         engine = exec_mode.get_engine()
-        _apply_default_opt(engine)
-        engine.opt.update(opt)
+        apply_default_opt(engine)
+        apply_engine_opt(engine, opt)
         exit_code = _run_engine_patched(engine, container_id, proc, supervisor_path)
         with proc.lock:
             proc.status = "exited"

@@ -23,7 +23,13 @@ from udocker.helper.hostinfo import HostInfo
 from udocker.utils.fileutil import FileUtil
 
 from udockerd import udocker_ctx
-from udockerd.container_proc import called_from_engine_run, original_popen, patch_lock
+from udockerd.container_proc import (
+    apply_default_opt,
+    apply_engine_opt,
+    called_from_engine_run,
+    original_popen,
+    patch_lock,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -506,10 +512,8 @@ def run_instruction(
     uctx = udocker_ctx.get()
     exec_mode = ExecutionMode(uctx.local, container_id)
     engine = exec_mode.get_engine()
-    engine.opt = dict(engine.opt)
-    engine.opt.setdefault("kernel", "")
-    engine.opt.setdefault("netcoop", False)
-    engine.opt.update(opt)
+    apply_default_opt(engine)
+    apply_engine_opt(engine, opt)
     engine.opt["cmd"] = cmd
 
     lines: queue.Queue[str] = queue.Queue()
