@@ -23,6 +23,7 @@ import tarfile
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from udocker.container.structure import ContainerStructure
@@ -30,28 +31,27 @@ from udocker.container.structure import ContainerStructure
 from udockerd import udocker_ctx
 from udockerd.builder import StageConfig, _materialize_image_root, commit_layer
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
-@pytest.fixture
-def isolated_uctx(monkeypatch, tmp_path):
-    """Fresh UdockerContext against a throwaway UDOCKER_DIR, with a
-    minimal fake base image already registered so create_fromimage has
-    something to extract.
+    from udockerd.udocker_ctx import UdockerContext
+
+
+def _register_fake_image(
+    uctx: UdockerContext, tmp_path: Path, imagerepo: str, tag: str, filename: str
+) -> None:
+    """Registers a minimal fake image (one layer containing a single,
+    distinctively-named file) in the given repo:tag so create_fromimage
+    has something to extract.
     """
-    monkeypatch.setenv("UDOCKER_DIR", str(tmp_path))
-    monkeypatch.setenv("UDOCKER_USE_CURL_EXECUTABLE", "curl")
-
-    udocker_ctx._context = None  # noqa: SLF001 - reset the module singleton between tests
-    uctx = udocker_ctx.init()
-
-    imagerepo, tag = "test/fakeimg", "latest"
     uctx.local.setup_imagerepo(imagerepo)
     uctx.local.setup_tag(tag)
     uctx.local.set_version("v2")
 
-    layer_path = tmp_path / "fakelayer.tar"
+    layer_path = tmp_path / f"{filename}.tar"
     with tarfile.open(layer_path, "w") as tf:
-        data = b"hello"
-        info = tarfile.TarInfo("hello.txt")
+        data = filename.encode()
+        info = tarfile.TarInfo(filename)
         info.size = len(data)
         tf.addfile(info, io.BytesIO(data))
 
@@ -76,12 +76,57 @@ def isolated_uctx(monkeypatch, tmp_path):
     shutil.copy2(layer_path, layer_dest)
     uctx.local.add_image_layer(str(layer_dest))
 
+
+@pytest.fixture
+def isolated_uctx(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[tuple[UdockerContext, str, str]]:
+    """Fresh UdockerContext against a throwaway UDOCKER_DIR, with a
+    minimal fake base image already registered so create_fromimage has
+    something to extract.
+    """
+    monkeypatch.setenv("UDOCKER_DIR", str(tmp_path))
+    monkeypatch.setenv("UDOCKER_USE_CURL_EXECUTABLE", "curl")
+
+    udocker_ctx._context = None  # noqa: SLF001 - reset the module singleton between tests
+    uctx = udocker_ctx.init()
+
+    imagerepo, tag = "test/fakeimg", "latest"
+    _register_fake_image(uctx, tmp_path, imagerepo, tag, "hello.txt")
+
     yield uctx, imagerepo, tag
 
     udocker_ctx._context = None  # noqa: SLF001
 
 
-def test_concurrent_commit_layer_does_not_corrupt_cursor(isolated_uctx):
+@pytest.fixture
+def isolated_uctx_two_images(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[tuple[UdockerContext, tuple[str, str], tuple[str, str]]]:
+    """Like isolated_uctx, but with two distinct fake images registered
+    so cursor cross-contamination between them is observable (unlike a
+    single shared image, where both threads materializing the same
+    repo:tag would look identical regardless of any cursor mixup).
+    """
+    monkeypatch.setenv("UDOCKER_DIR", str(tmp_path))
+    monkeypatch.setenv("UDOCKER_USE_CURL_EXECUTABLE", "curl")
+
+    udocker_ctx._context = None  # noqa: SLF001 - reset the module singleton between tests
+    uctx = udocker_ctx.init()
+
+    imagerepo_a, tag_a = "test/fakeimg-a", "latest"
+    imagerepo_b, tag_b = "test/fakeimg-b", "latest"
+    _register_fake_image(uctx, tmp_path, imagerepo_a, tag_a, "hello-a.txt")
+    _register_fake_image(uctx, tmp_path, imagerepo_b, tag_b, "hello-b.txt")
+
+    yield uctx, (imagerepo_a, tag_a), (imagerepo_b, tag_b)
+
+    udocker_ctx._context = None  # noqa: SLF001
+
+
+def test_concurrent_commit_layer_does_not_corrupt_cursor(
+    isolated_uctx: tuple[UdockerContext, str, str],
+) -> None:
     uctx, imagerepo, tag = isolated_uctx
 
     uctx.local.cd_imagerepo(imagerepo, tag)
@@ -97,11 +142,11 @@ def test_concurrent_commit_layer_does_not_corrupt_cursor(isolated_uctx):
     original_setup_tag = uctx.local.setup_tag
 
     def slow_setup_tag(t: str) -> bool:
-        result = original_setup_tag(t)
+        result: bool = original_setup_tag(t)
         time.sleep(0.2)
         return result
 
-    uctx.local.setup_tag = slow_setup_tag  # type: ignore[method-assign]
+    uctx.local.setup_tag = slow_setup_tag
 
     def worker(name: str, container_id: str, image_name: str) -> None:
         config = StageConfig()
@@ -127,34 +172,50 @@ def test_concurrent_commit_layer_does_not_corrupt_cursor(isolated_uctx):
     assert attrs_b["config"]["Env"] == ["B=value"]
 
 
-def test_concurrent_materialize_image_root_does_not_corrupt_cursor(isolated_uctx):
-    """Same hazard, for _materialize_image_root() (COPY --from=<image>)."""
-    uctx, imagerepo, tag = isolated_uctx
+def test_concurrent_materialize_image_root_does_not_corrupt_cursor(
+    isolated_uctx_two_images: tuple[UdockerContext, tuple[str, str], tuple[str, str]],
+) -> None:
+    """Same hazard, for _materialize_image_root() (COPY --from=<image>).
+
+    Uses two *distinct* source images: create_fromimage's own sequence is
+    cd_imagerepo() (repoints the cursor) followed by get_image_attributes()
+    (reads it), so without the lock spanning both, thread B's cd_imagerepo
+    can repoint the cursor while thread A is between those two calls,
+    making A extract B's layers into A's container. Both threads pulling
+    the *same* image/tag can't observe this — the wrong-cursor result is
+    indistinguishable from the right one. Distinct images make a mixup
+    detectable: each ROOT must contain only its own image's file.
+    """
+    uctx, (imagerepo_a, tag_a), (imagerepo_b, tag_b) = isolated_uctx_two_images
 
     original_cd_imagerepo = uctx.local.cd_imagerepo
 
-    def slow_cd_imagerepo(repo: str, t: str):  # noqa: ANN001
-        result = original_cd_imagerepo(repo, t)
+    def slow_cd_imagerepo(repo: str, t: str) -> str:
+        result: str = original_cd_imagerepo(repo, t)
         time.sleep(0.2)
         return result
 
-    uctx.local.cd_imagerepo = slow_cd_imagerepo  # type: ignore[method-assign]
+    uctx.local.cd_imagerepo = slow_cd_imagerepo
 
     errors: list[BaseException] = []
 
-    def worker(name: str) -> None:
+    def worker(name: str, imagerepo: str, tag: str, expected_file: str, other_file: str) -> None:
         try:
             root, container_id = _materialize_image_root(f"{imagerepo}:{tag}")
-            # The extracted ROOT must actually contain this image's file;
-            # a corrupted cursor could point create_fromimage at a
-            # half-configured or wrong tag directory instead.
-            assert (root / "hello.txt").exists(), f"{name}: missing expected file in ROOT"
+            assert (root / expected_file).exists(), f"{name}: missing expected file in ROOT"
+            assert not (root / other_file).exists(), (
+                f"{name}: found {other_file} — cursor corrupted, wrong image materialized"
+            )
             uctx.local.del_container(container_id, force=True)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    thread_a = threading.Thread(target=worker, args=("A",))
-    thread_b = threading.Thread(target=worker, args=("B",))
+    thread_a = threading.Thread(
+        target=worker, args=("A", imagerepo_a, tag_a, "hello-a.txt", "hello-b.txt")
+    )
+    thread_b = threading.Thread(
+        target=worker, args=("B", imagerepo_b, tag_b, "hello-b.txt", "hello-a.txt")
+    )
     thread_a.start()
     time.sleep(0.05)
     thread_b.start()
