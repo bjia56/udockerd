@@ -1,0 +1,10 @@
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.redwall
+.claude
+venv
+**/__pycache__
+*.pyc

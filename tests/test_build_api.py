@@ -2,6 +2,8 @@
 real docker SDK against the test harness.
 """
 
+import subprocess
+import tarfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -11,6 +13,7 @@ import docker.errors
 import pytest
 
 IMAGE = "alpine:latest"
+UNPULLED_IMAGE = "busybox:latest"
 
 
 @pytest.fixture
@@ -152,3 +155,69 @@ def test_build_unsupported_instruction_fails(client: docker.DockerClient, tmp_pa
     )
     with pytest.raises(docker.errors.BuildError):
         client.images.build(path=str(context), tag=tag)
+
+
+def test_build_accepts_chunked_transfer_encoding(
+    harness_port: int, client: docker.DockerClient, tmp_path: Path
+) -> None:
+    """Regression test: the real `docker` CLI (unlike docker-py's SDK)
+    streams the build context with `Transfer-Encoding: chunked` and no
+    Content-Length, since it doesn't know the tar's size upfront. RequestContext.read_body()
+    used to only honor Content-Length, so the daemon read an empty body
+    and the build failed with a bogus "empty file" tar error.
+    """
+    tag = _unique_tag("build-chunked")
+    context = _write_dockerfile(
+        tmp_path,
+        f"""
+        FROM {IMAGE}
+        RUN echo chunked-ok > /marker.txt
+        CMD ["cat", "/marker.txt"]
+        """,
+    )
+    tar_path = tmp_path / "context.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        tar.add(context / "Dockerfile", arcname="Dockerfile")
+
+    result = subprocess.run(
+        [
+            "curl", "-sf",
+            "-H", "Transfer-Encoding: chunked",
+            "--data-binary", f"@{tar_path}",
+            f"http://127.0.0.1:{harness_port}/build?t={tag}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert '"error"' not in result.stdout, result.stdout
+
+    image = client.images.get(tag)
+    assert any(tag in (t or "") for t in image.tags)
+
+
+def test_build_pulls_missing_base_image(client: docker.DockerClient, tmp_path: Path) -> None:
+    """Regression test: `FROM <image>` in a Dockerfile only resolved
+    against images already present locally and errored with "no such
+    image" otherwise, unlike the real daemon which pulls a missing base
+    image automatically.
+    """
+    with pytest.raises(docker.errors.ImageNotFound):
+        client.images.get(UNPULLED_IMAGE)
+
+    tag = _unique_tag("build-autopull")
+    context = _write_dockerfile(
+        tmp_path,
+        f"""
+        FROM {UNPULLED_IMAGE}
+        RUN echo autopulled > /marker.txt
+        CMD ["cat", "/marker.txt"]
+        """,
+    )
+    image, _logs = client.images.build(path=str(context), tag=tag)
+    output = client.containers.run(tag, remove=True)
+    assert output.strip() == b"autopulled"
+
+    # The pull as a side effect of the build should also have populated
+    # the local image cache for the base image itself.
+    assert client.images.get(UNPULLED_IMAGE) is not None

@@ -712,6 +712,16 @@ def build(
 
             with uctx.lock:
                 resolved = udocker_ctx.resolve_imagerepo(uctx, stage.base_image, stage.base_tag)
+                need_pull = resolved is None
+
+            if need_pull:
+                yield {"stream": f"Pulling from {stage.base_image}\n"}
+
+            with uctx.lock:
+                if need_pull:
+                    if not uctx.dockerioapi.get(stage.base_image, stage.base_tag):
+                        raise BuildError(f"no such image: {base_spec}")
+                    resolved = udocker_ctx.resolve_imagerepo(uctx, stage.base_image, stage.base_tag)
                 if resolved is None:
                     raise BuildError(f"no such image: {base_spec}")
                 imagerepo, tag = resolved

@@ -66,10 +66,26 @@ class RequestContext:
 
     def read_body(self) -> bytes:
         """Raw request body, e.g. a build context tar."""
+        if self._handler.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            return self._read_chunked_body()
         length = int(self._handler.headers.get("Content-Length", 0) or 0)
         if not length:
             return b""
         return self._handler.rfile.read(length)
+
+    def _read_chunked_body(self) -> bytes:
+        rfile = self._handler.rfile
+        chunks = []
+        while True:
+            size_line = rfile.readline().strip()
+            size = int(size_line.split(b";", 1)[0], 16)
+            if size == 0:
+                while rfile.readline().strip():
+                    pass
+                break
+            chunks.append(rfile.read(size))
+            rfile.readline()
+        return b"".join(chunks)
 
     def read_json(self) -> Any:
         body = self.read_body()
