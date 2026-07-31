@@ -157,6 +157,35 @@ def test_build_unsupported_instruction_fails(client: docker.DockerClient, tmp_pa
         client.images.build(path=str(context), tag=tag)
 
 
+def test_build_inherits_base_image_config(client: docker.DockerClient, tmp_path: Path) -> None:
+    """Regression test: each stage's config used to start empty instead
+    of inheriting the base image's own Config (Env/Cmd/Entrypoint/etc),
+    so a build that didn't repeat e.g. PATH or CMD lost it entirely -
+    `docker run` on the result failed with "command not found" even
+    though the base image itself runs fine.
+    """
+    tag = _unique_tag("build-inherit-config")
+    base_image = client.images.get(IMAGE)
+    base_env = base_image.attrs["Config"]["Env"] or []
+    base_cmd = base_image.attrs["Config"]["Cmd"]
+    assert base_cmd, "test assumes the base image has a default Cmd"
+
+    context = _write_dockerfile(
+        tmp_path,
+        f"""
+        FROM {IMAGE}
+        RUN echo hi
+        """,
+    )
+    image, _logs = client.images.build(path=str(context), tag=tag)
+    assert image.attrs["Config"]["Env"] == base_env
+    assert image.attrs["Config"]["Cmd"] == base_cmd
+
+    # No CMD/ENTRYPOINT override in the Dockerfile: this only succeeds
+    # if the base image's Cmd carried through to the built image.
+    client.containers.run(tag, remove=True)
+
+
 def test_build_accepts_chunked_transfer_encoding(
     harness_port: int, client: docker.DockerClient, tmp_path: Path
 ) -> None:

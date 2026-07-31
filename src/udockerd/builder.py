@@ -174,6 +174,39 @@ class StageConfig:
         }
 
 
+def _base_stage_config(
+    uctx: udocker_ctx.UdockerContext, container_json: dict[str, Any] | None
+) -> StageConfig:
+    """Seeds a stage's config from its FROM image's own saved Config
+    section (Env/Cmd/Entrypoint/etc), matching real Docker: each stage
+    starts as a copy of its base image's config, and Dockerfile
+    instructions overlay on top of it. Without this, PATH and every
+    other inherited setting (Cmd/Entrypoint especially) silently vanish
+    from images built on top of a base that doesn't repeat them.
+    """
+    config = StageConfig()
+    if not container_json:
+        return config
+
+    structure = ContainerStructure(uctx.local)
+    for pair in structure.get_container_meta("Env", [], container_json):
+        if "=" in pair:
+            key, _, value = pair.partition("=")
+            config.Env[key] = value
+    config.WorkingDir = structure.get_container_meta("WorkingDir", "", container_json)
+    config.User = structure.get_container_meta("User", "", container_json)
+    config.Cmd = structure.get_container_meta("Cmd", [], container_json) or None
+    config.Entrypoint = structure.get_container_meta("Entrypoint", [], container_json) or None
+    labels = structure.get_container_meta("Labels", {}, container_json)
+    config.Labels = dict(labels) if labels else {}
+    exposed = structure.get_container_meta("ExposedPorts", {}, container_json)
+    config.ExposedPorts = dict(exposed) if isinstance(exposed, dict) else {}
+    volumes = structure.get_container_meta("Volumes", {}, container_json)
+    config.Volumes = dict(volumes) if isinstance(volumes, dict) else {}
+    config.StopSignal = structure.get_container_meta("StopSignal", "", container_json)
+    return config
+
+
 def apply_metadata_instruction(op: str, args: str, config: StageConfig) -> None:
     """Mutates config for one metadata-only instruction (ENV, WORKDIR,
     USER, LABEL, CMD, ENTRYPOINT, EXPOSE, VOLUME, ARG, STOPSIGNAL). ARG is
@@ -725,6 +758,7 @@ def build(
                 if resolved is None:
                     raise BuildError(f"no such image: {base_spec}")
                 imagerepo, tag = resolved
+                base_container_json, _base_layers = uctx.local.get_image_attributes()
                 container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
             if not container_id:
                 raise BuildError(f"failed to create build stage from {stage.base_image}")
@@ -733,7 +767,7 @@ def build(
             container_dir = Path(uctx.local.cd_container(container_id))
             root = container_dir / "ROOT"
 
-            config = StageConfig()
+            config = _base_stage_config(uctx, base_container_json)
             for instruction in stage.instructions:
                 step += 1
                 yield {"stream": f"Step {step}/{total_steps} : {instruction.raw}\n"}
