@@ -4,6 +4,8 @@ not a hand-rolled client. Each test cleans up the containers/images it
 creates so the shared session-scoped harness stays usable across tests.
 """
 
+import os
+import pty
 import subprocess
 import time
 from collections.abc import Iterator
@@ -215,6 +217,83 @@ def test_docker_run_foreground_attaches(harness_port: int) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "attach output" in result.stdout
+
+
+def test_container_tty_logs_capture_output(client: docker.DockerClient) -> None:
+    """Regression guard: spawn_tty_reader's first os.read(master_fd) reliably
+    hit EIO (pty master read races the supervisor's forked child setsid()ing
+    and opening the slave) and treated any OSError as fatal, killing the
+    reader thread before it ever delivered a byte -- TTY container output
+    was silently lost for the container's entire life.
+    """
+    name = _unique_name("ttylogs")
+    container = client.containers.run(
+        IMAGE, command=["sh", "-c", "echo tty-output"], name=name, tty=True, detach=True
+    )
+    container.wait()
+    logs = container.logs()
+    assert b"tty-output" in logs
+    container.remove()
+
+
+def test_container_resize(client: docker.DockerClient) -> None:
+    name = _unique_name("resize")
+    container = client.containers.run(
+        IMAGE, command=["sleep", "5"], name=name, tty=True, detach=True
+    )
+    container.resize(height=30, width=100)  # raises APIError on non-2xx
+    container.stop(timeout=5)
+    container.remove()
+
+
+def test_docker_run_tty_does_not_hang(harness_port: int) -> None:
+    """Exact user-facing repro: `docker run -it` hung until the CLI was
+    killed. Root cause was two bugs: (1) above, output never arriving, and
+    (2) stream_session's stdin-forwarding thread blocks on rfile.read(1);
+    once the container exited, BaseHTTPRequestHandler.finish()'s
+    rfile.close() needed the same internal lock that blocked read held,
+    deadlocking the connection closed and hanging the client forever.
+    `-t` needs a real pty since the docker CLI checks its local stdin.
+    """
+    name = _unique_name("ttyhang")
+    env = {"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"}
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        ["docker", "run", "-it", "--name", name, IMAGE, "sh", "-c", "echo tty-hang-guard; sleep 1"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+    )
+    os.close(slave_fd)
+    start = time.monotonic()
+    try:
+        returncode = proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        os.close(master_fd)
+        subprocess.run(["docker", "rm", "-f", name], env=env, capture_output=True)
+        pytest.fail("docker run -it hung past 15s (TTY session deadlock regression)")
+    elapsed = time.monotonic() - start
+
+    output = b""
+    try:
+        while True:
+            chunk = os.read(master_fd, 65536)
+            if not chunk:
+                break
+            output += chunk
+    except OSError:
+        pass
+    finally:
+        os.close(master_fd)
+
+    assert returncode == 0
+    assert elapsed < 10
+    assert b"tty-hang-guard" in output
+
+    subprocess.run(["docker", "rm", "-f", name], env=env, capture_output=True)
 
 
 def test_docker_run_bad_exec_reports_error_and_does_not_hang(harness_port: int) -> None:
