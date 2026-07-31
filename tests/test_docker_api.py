@@ -135,6 +135,36 @@ def test_container_kill(client: docker.DockerClient) -> None:
     container.remove()
 
 
+def test_container_start_bad_exec_reports_error(client: docker.DockerClient) -> None:
+    """Regression guard: engine.run() raising before it ever exec's (e.g.
+    an unexecutable Cmd like "--") used to only print to the daemon's own
+    console; /start unconditionally sent 204. The client must see a
+    synchronous error instead of a fake success.
+    """
+    name = _unique_name("badexec")
+    container = client.containers.create(IMAGE, command=["--", "bash"], name=name)
+    with pytest.raises(docker.errors.APIError):
+        container.start()
+
+    container.reload()
+    assert container.status == "exited"
+    assert container.attrs["State"]["ExitCode"] != 0
+    assert container.attrs["State"]["Error"]
+    container.remove()
+
+
+def test_container_exec_bad_cmd_reports_error(client: docker.DockerClient) -> None:
+    """Same underlying spawn() fix, exercised via exec: a bad exec target
+    used to leave the exec instance stuck with ExitCode None forever.
+    """
+    name = _unique_name("execbadcmd")
+    container = client.containers.run(IMAGE, command=["sleep", "30"], name=name, detach=True)
+    exit_code, _output = container.exec_run(["--"])
+    assert exit_code != 0
+    container.stop(timeout=5)
+    container.remove()
+
+
 def test_container_network_settings_shape(client: docker.DockerClient) -> None:
     """Guards the NetworkSettings.Networks nested-map shape (not a flat
     IPAddress field).
@@ -185,3 +215,29 @@ def test_docker_run_foreground_attaches(harness_port: int) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "attach output" in result.stdout
+
+
+def test_docker_run_bad_exec_reports_error_and_does_not_hang(harness_port: int) -> None:
+    """Exact user-facing repro: `docker run image -- bash` makes "--" the
+    exec target, which fails to exec. Real dockerd returns this error to
+    the CLI synchronously; it must not hang and must not exit 0.
+    """
+    name = _unique_name("clibadexec")
+    start = time.monotonic()
+    result = subprocess.run(
+        ["docker", "run", "--name", name, IMAGE, "--", "bash"],
+        env={"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    elapsed = time.monotonic() - start
+    assert result.returncode != 0
+    assert elapsed < 5
+    assert result.stderr.strip()
+
+    subprocess.run(
+        ["docker", "rm", "-f", name],
+        env={"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+    )

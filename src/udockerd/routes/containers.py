@@ -53,6 +53,7 @@ def _inspect_json(proc: ContainerProc) -> dict[str, Any]:
             "Running": proc.status == "running",
             "Pid": proc.pid or 0,
             "ExitCode": proc.exit_code or 0,
+            "Error": proc.error or "",
             "StartedAt": "",
             "FinishedAt": "",
         },
@@ -170,6 +171,15 @@ def start(ctx: RequestContext) -> None:
 
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     container_proc.spawn(proc)
+
+    with proc.lock:
+        error = proc.error
+    if error is not None:
+        # engine.run() raised before ever exec'ing (e.g. bad Cmd/Entrypoint):
+        # real dockerd reports this synchronously from /start rather than
+        # leaving the client to wait on a container that never started.
+        ctx.send_json(500, {"message": f"OCI runtime create failed: {error}"})
+        return
     ctx.send_empty(204)
 
 

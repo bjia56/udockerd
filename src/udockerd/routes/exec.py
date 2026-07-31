@@ -67,6 +67,11 @@ def start(ctx: RequestContext) -> None:
     container_proc.spawn(exec_proc)
 
     if detach:
+        with exec_proc.lock:
+            error = exec_proc.error
+        if error is not None:
+            ctx.send_json(500, {"message": f"OCI runtime exec failed: {error}"})
+            return
         ctx.send_empty(200)
         return
 
@@ -98,6 +103,7 @@ def inspect(ctx: RequestContext) -> None:
             "ID": exec_id,
             "Running": exec_proc.status == "running",
             "ExitCode": exec_proc.exit_code,
+            "Error": exec_proc.error or "",
             "ContainerID": exec_proc.container_id,
         },
     )

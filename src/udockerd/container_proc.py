@@ -142,6 +142,10 @@ class ContainerProc:
     pgid: int | None = None
     status: str = "created"  # created, running, exited
     exit_code: int | None = None
+    # Set when engine.run() raises before/without ever exec'ing the target
+    # (e.g. missing/non-executable Cmd) so /start and /wait can report it,
+    # instead of the exception only reaching the daemon's own stderr.
+    error: str | None = None
     logfile: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -262,11 +266,28 @@ def spawn(proc: ContainerProc) -> None:
         engine = exec_mode.get_engine()
         apply_default_opt(engine)
         apply_engine_opt(engine, opt)
-        exit_code = _run_engine_patched(engine, container_id, proc, supervisor_path)
+        try:
+            exit_code = _run_engine_patched(engine, container_id, proc, supervisor_path)
+        except Exception as exc:  # noqa: BLE001 - surface as container State.Error
+            with proc.lock:
+                proc.status = "exited"
+                proc.exit_code = 127
+                proc.error = str(exc)
+                proc.finished_at = time.time()
+                proc.lock.notify_all()
+            return
         with proc.lock:
             proc.status = "exited"
             proc.exit_code = exit_code
             proc.finished_at = time.time()
+            if proc.pid is None and exit_code != 0:
+                # engine.run() never reached Popen at all (e.g. udocker's
+                # own pre-exec check in ExecutionEngineCommon._check_executable
+                # rejected a missing/non-executable Cmd/Entrypoint and
+                # returned early) -- distinct from a process that started
+                # and later exited non-zero on its own, where pid is set.
+                cmd = proc.opt.get("entryp") or proc.opt.get("cmd") or []
+                proc.error = f"command not found or has no execute bit set: {cmd}"
             proc.lock.notify_all()
 
     thread = threading.Thread(target=target, daemon=True)
