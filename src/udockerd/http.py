@@ -5,8 +5,10 @@ framework (aiohttp/flask/etc) is available. Routes are registered per
 method+path-regex and matched in order.
 """
 
+import contextlib
 import json
 import re
+import socket
 import socketserver
 import struct
 from collections.abc import Callable
@@ -125,6 +127,19 @@ class RequestContext:
         # Otherwise BaseHTTPRequestHandler tries to parse a next request
         # off the now-raw socket, and clients reading until EOF hang.
         self._handler.close_connection = True
+
+    def shutdown_read(self) -> None:
+        """Unblocks a thread stuck in a blocking rfile.read() (TTY stdin
+        forwarding, container_proc.stream_session) once the session is
+        over. Plain rfile.close() deadlocks here: BufferedReader.close()
+        needs the same internal per-object lock a concurrent in-progress
+        read() call is holding, so it blocks forever waiting for a read
+        that's waiting for bytes nobody will send. Shutting down the raw
+        socket instead interrupts that read (returns b"") without
+        touching the buffered wrapper's lock.
+        """
+        with contextlib.suppress(OSError):
+            self._handler.connection.shutdown(socket.SHUT_RDWR)
 
 
 def make_handler_class(router: Router) -> type[BaseHTTPRequestHandler]:

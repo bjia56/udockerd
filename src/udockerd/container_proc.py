@@ -13,11 +13,15 @@ the supervisor or pid tracking.
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import os
 import pty
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
@@ -349,7 +353,22 @@ def spawn_tty_reader(proc: ContainerProc, master_fd: int) -> None:
             while True:
                 try:
                     chunk = os.read(master_fd, 65536)
-                except OSError:
+                except OSError as exc:
+                    # EIO: the supervisor's forked child hasn't setsid()'d and
+                    # opened the pty slave yet (we start reading right after
+                    # Popen() returns, which only guarantees fork() happened,
+                    # not that the child has run). Linux returns EIO rather
+                    # than blocking when a pty master is read before any
+                    # process holds the slave open. Retry until either the
+                    # slave opens (read succeeds) or the container has
+                    # actually exited (real, permanent hangup).
+                    if exc.errno == errno.EIO:
+                        with proc.lock:
+                            exited = proc.status == "exited"
+                        if exited:
+                            break
+                        time.sleep(0.02)
+                        continue
                     break
                 if not chunk:
                     break
@@ -388,11 +407,34 @@ def write_tty_stdin(proc: ContainerProc, data: bytes) -> None:
             os.write(proc.pty_master_fd, data)
 
 
-def stream_session(proc: ContainerProc, out: Any, in_: Any, *, frame: Any) -> None:
+def resize_tty(proc: ContainerProc, height: int, width: int) -> bool:
+    """Backs /containers/{id}/resize and /exec/{id}/resize. Returns False
+    (caller sends 404/409) if there's no pty, or the ioctl itself failed
+    (e.g. the container exited and the pty was torn down between the
+    None-check and the call) -- not swallowed silently, since the docker
+    CLI's own resize retry/give-up loop already treats a non-2xx here as
+    the expected best-effort failure path.
+    """
+    if proc.pty_master_fd is None:
+        return False
+    winsize = struct.pack("HHHH", height, width, 0, 0)
+    try:
+        fcntl.ioctl(proc.pty_master_fd, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        return False
+    return True
+
+
+def stream_session(
+    proc: ContainerProc, out: Any, in_: Any, *, frame: Any, on_stop: Any = None
+) -> None:
     """Shared by exec start and attach. TTY path: subscribe to the pty
     reader, forward stdin, raw passthrough. Non-TTY: tail_log
-    (output-only, multiplex-framed). `in_` is the rfile for stdin
-    forwarding, or None to skip it.
+    (output-only, multiplex-framed).
+
+    `on_stop`, if given, runs once the session ends, to unblock
+    forward_stdin's blocking read -- rfile.close() alone deadlocks (see
+    RequestContext.shutdown_read).
     """
     if not proc.tty:
         tail_log(proc, out, follow=True, frame=frame)
@@ -429,6 +471,9 @@ def stream_session(proc: ContainerProc, out: Any, in_: Any, *, frame: Any) -> No
     finally:
         unsubscribe_tty(proc, write, on_disconnect)
         done.set()
+        if on_stop is not None:
+            on_stop()
+        stdin_thread.join(timeout=1)
 
 
 def tail_log(proc: ContainerProc, out: Any, *, follow: bool, frame: Any) -> None:

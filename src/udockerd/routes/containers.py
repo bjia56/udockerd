@@ -305,7 +305,29 @@ def attach(ctx: RequestContext) -> None:
         ctx.wfile,
         ctx.rfile if hijacked else None,
         frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk),
+        on_stop=ctx.shutdown_read if hijacked else None,
     )
+
+
+def resize(ctx: RequestContext) -> None:
+    container_id = ctx.params["id"]
+    proc = container_proc.registry.get(container_id)
+    if proc is None:
+        ctx.send_json(404, {"message": f"No such container: {container_id}"})
+        return
+
+    query = _query(ctx)
+    try:
+        height = int(query.get("h", ["0"])[0])
+        width = int(query.get("w", ["0"])[0])
+    except ValueError:
+        ctx.send_json(400, {"message": "invalid height/width"})
+        return
+
+    if not container_proc.resize_tty(proc, height, width):
+        ctx.send_json(500, {"message": "cannot resize container"})
+        return
+    ctx.send_empty(200)
 
 
 def wait(ctx: RequestContext) -> None:
@@ -340,3 +362,4 @@ def register(router: Router) -> None:
     router.add("GET", r"^/containers/(?P<id>[^/]+)/logs$", logs)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/wait$", wait)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/attach$", attach)
+    router.add("POST", r"^/containers/(?P<id>[^/]+)/resize$", resize)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 from udockerd import container_proc
 from udockerd.http import STREAM_STDOUT, stream_frame
@@ -88,7 +89,29 @@ def start(ctx: RequestContext) -> None:
         ctx.wfile,
         ctx.rfile if hijacked else None,
         frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk),
+        on_stop=ctx.shutdown_read if hijacked else None,
     )
+
+
+def resize(ctx: RequestContext) -> None:
+    exec_id = ctx.params["id"]
+    exec_proc = _registry.get(exec_id)
+    if exec_proc is None:
+        ctx.send_json(404, {"message": f"No such exec instance: {exec_id}"})
+        return
+
+    query = parse_qs(urlsplit(ctx.path).query)
+    try:
+        height = int(query.get("h", ["0"])[0])
+        width = int(query.get("w", ["0"])[0])
+    except ValueError:
+        ctx.send_json(400, {"message": "invalid height/width"})
+        return
+
+    if not container_proc.resize_tty(exec_proc, height, width):
+        ctx.send_json(500, {"message": "cannot resize exec instance"})
+        return
+    ctx.send_empty(200)
 
 
 def inspect(ctx: RequestContext) -> None:
@@ -121,4 +144,5 @@ def stop_execs_for(container_id: str, grace_seconds: float = 5.0) -> None:
 def register(router: Router) -> None:
     router.add("POST", r"^/containers/(?P<id>[^/]+)/exec$", create)
     router.add("POST", r"^/exec/(?P<id>[^/]+)/start$", start)
+    router.add("POST", r"^/exec/(?P<id>[^/]+)/resize$", resize)
     router.add("GET", r"^/exec/(?P<id>[^/]+)/json$", inspect)
