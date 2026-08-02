@@ -17,8 +17,14 @@ jobs:
 
       - name: Get Cosmopolitan Python
         run: |
-          wget https://cosmo.zip/pub/cosmos/bin/python -O python.exe
+          wget https://github.com/bjia56/portable-python/releases/download/cpython-v3.13.10-beta.1/python-3.13.10t-cosmo-unknown.zip -O python-cosmo.zip
+          unzip -p python-cosmo.zip "python-3.13.10t-cosmo-unknown/bin/python.standalone.com" > python.exe
           chmod +x python.exe
+
+          # This build's site-packages path is versioned (lib/python3.13t/site-packages),
+          # unlike cosmo.zip's Lib/site-packages, so derive it instead of hardcoding.
+          site_packages=$(./python.exe -c "import sysconfig; print(sysconfig.get_path('purelib').removeprefix('/zip/'))")
+          echo "PY_SITE_PACKAGES=$site_packages" >> "$GITHUB_ENV"
 
       - name: Set up zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -45,7 +51,7 @@ jobs:
 
           folders=$(ls setuptools_temp)
           for folder in $folders; do
-            ./python.exe scripts/add_to_zip.py ./setuptools_temp/"$folder" ./python_with_setuptools.exe Lib/site-packages/"$folder"
+            ./python.exe scripts/add_to_zip.py ./setuptools_temp/"$folder" ./python_with_setuptools.exe "$PY_SITE_PACKAGES/$folder"
           done
 
           rm -rf setuptools_temp
@@ -62,7 +68,7 @@ jobs:
 
           folders=$(ls udockerd_temp)
           for folder in $folders; do
-            ./python_with_setuptools.exe scripts/add_to_zip.py ./udockerd_temp/"$folder" ./python.exe Lib/site-packages/"$folder"
+            ./python_with_setuptools.exe scripts/add_to_zip.py ./udockerd_temp/"$folder" ./python.exe "$PY_SITE_PACKAGES/$folder"
           done
 
           zip -urj python.exe scripts/.args
