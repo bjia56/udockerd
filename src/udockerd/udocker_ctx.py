@@ -30,29 +30,40 @@ class UdockerContext:
 
 
 _context: UdockerContext | None = None
+_context_lock = threading.Lock()
 
 
 def init() -> UdockerContext:
-    """Idempotent: safe to call once at startup before serving requests."""
+    """Idempotent: safe to call more than once, or concurrently, though in
+    practice it's only ever called once at startup before serving requests.
+    """
     global _context
-    if _context is not None:
+    with _context_lock:
+        if _context is not None:
+            return _context
+
+        Config().getconf()
+        # Only proot/fakechroot are supported (no root, no namespaces/cgroups
+        # on Termux); default_execution_modes otherwise falls back to 'R1'
+        # (runc) for unrecognized/DEFAULT and ppc64le arches, which isn't
+        # usable here and isn't synchronized for concurrent engine use in
+        # udocker's own runc/singularity engines.
+        Config.conf["default_execution_modes"]["DEFAULT"] = "P1"
+        Config.conf["default_execution_modes"]["ppc64le"] = "P1"
+
+        local = LocalRepository()
+        if not local.is_repo():
+            local.create_repo()
+
+        if not UdockerTools(local).install(False):
+            raise RuntimeError("failed to install udocker execution tools (proot/fakechroot)")
+
+        _context = UdockerContext(
+            local=local,
+            dockerioapi=DockerIoAPI(local),
+            lock=threading.Lock(),
+        )
         return _context
-
-    Config().getconf()
-
-    local = LocalRepository()
-    if not local.is_repo():
-        local.create_repo()
-
-    if not UdockerTools(local).install(False):
-        raise RuntimeError("failed to install udocker execution tools (proot/fakechroot)")
-
-    _context = UdockerContext(
-        local=local,
-        dockerioapi=DockerIoAPI(local),
-        lock=threading.Lock(),
-    )
-    return _context
 
 
 def get() -> UdockerContext:

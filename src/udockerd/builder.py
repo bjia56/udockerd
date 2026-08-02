@@ -465,9 +465,9 @@ def _materialize_image_root(image_spec: str) -> tuple[Path, str]:
             raise BuildError(f"COPY --from: no such image: {image_spec}")
         imagerepo, tag = resolved
         container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
-    if not container_id:
-        raise BuildError(f"COPY --from: failed to materialize image: {image_spec}")
-    container_dir = uctx.local.cd_container(container_id)
+        if not container_id:
+            raise BuildError(f"COPY --from: failed to materialize image: {image_spec}")
+        container_dir = uctx.local.cd_container(container_id)
     return Path(container_dir) / "ROOT", container_id
 
 
@@ -535,7 +535,9 @@ def copy_instruction(
                 shutil.copy2(src_path, target)
     finally:
         if from_container_id is not None:
-            udocker_ctx.get().local.del_container(from_container_id, force=True)
+            uctx = udocker_ctx.get()
+            with uctx.lock:
+                uctx.local.del_container(from_container_id, force=True)
 
 
 def run_instruction(
@@ -640,7 +642,8 @@ def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str
     pulled images, so inspect/list read this the same way as a real pull.
     """
     uctx = udocker_ctx.get()
-    container_dir = Path(uctx.local.cd_container(container_id))
+    with uctx.lock:
+        container_dir = Path(uctx.local.cd_container(container_id))
     root = container_dir / "ROOT"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -760,11 +763,10 @@ def build(
                 imagerepo, tag = resolved
                 base_container_json, _base_layers = uctx.local.get_image_attributes()
                 container_id = ContainerStructure(uctx.local).create_fromimage(imagerepo, tag)
-            if not container_id:
-                raise BuildError(f"failed to create build stage from {stage.base_image}")
-
-            stage_container_ids.append(container_id)
-            container_dir = Path(uctx.local.cd_container(container_id))
+                if not container_id:
+                    raise BuildError(f"failed to create build stage from {stage.base_image}")
+                stage_container_ids.append(container_id)
+                container_dir = Path(uctx.local.cd_container(container_id))
             root = container_dir / "ROOT"
 
             config = _base_stage_config(uctx, base_container_json)

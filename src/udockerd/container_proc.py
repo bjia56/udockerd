@@ -109,7 +109,8 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
 
         if proc.tty:
             master_fd, slave_fd = pty.openpty()
-            proc.pty_master_fd = master_fd
+            with proc.pty_lock:
+                proc.pty_master_fd = master_fd
             tty_slave_path = os.ttyname(slave_fd)
             os.close(slave_fd)  # supervisor's forked child reopens it after its own setsid
             args = _prepend_supervisor(args, supervisor_path, tty_slave_path)
@@ -402,9 +403,12 @@ def unsubscribe_tty(proc: ContainerProc, write: Any, on_error: Any) -> None:
 
 
 def write_tty_stdin(proc: ContainerProc, data: bytes) -> None:
-    if proc.pty_master_fd is not None:
-        with contextlib.suppress(OSError):
-            os.write(proc.pty_master_fd, data)
+    with proc.pty_lock:
+        fd = proc.pty_master_fd
+    if fd is None:
+        return
+    with contextlib.suppress(OSError):
+        os.write(fd, data)
 
 
 def resize_tty(proc: ContainerProc, height: int, width: int) -> bool:
@@ -415,11 +419,13 @@ def resize_tty(proc: ContainerProc, height: int, width: int) -> bool:
     CLI's own resize retry/give-up loop already treats a non-2xx here as
     the expected best-effort failure path.
     """
-    if proc.pty_master_fd is None:
+    with proc.pty_lock:
+        fd = proc.pty_master_fd
+    if fd is None:
         return False
     winsize = struct.pack("HHHH", height, width, 0, 0)
     try:
-        fcntl.ioctl(proc.pty_master_fd, termios.TIOCSWINSZ, winsize)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
     except OSError:
         return False
     return True
