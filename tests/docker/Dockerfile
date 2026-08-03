@@ -2,7 +2,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev && \
+    apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev git && \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m udocker
@@ -13,6 +13,7 @@ WORKDIR /home/udocker/app
 
 COPY --chown=udocker:udocker pyproject.toml /home/udocker/app/pyproject.toml
 COPY --chown=udocker:udocker src /home/udocker/app/src
+COPY --chown=udocker:udocker .git /home/udocker/app/.git
 
 RUN pip install --user --no-cache-dir .
 
