@@ -59,6 +59,57 @@ def test_build_single_stage(client: docker.DockerClient, tmp_path: Path) -> None
     assert output.strip() == b"building"
 
 
+def test_build_run_multiline_continuation(client: docker.DockerClient, tmp_path: Path) -> None:
+    """Backslash-continued RUN lines must join onto one shell command, not
+    one with an embedded newline -- a bare "&& foo" on its own line is a
+    shell syntax error, unlike the joined "... && foo" real Docker runs.
+    """
+    tag = _unique_tag("build-continuation")
+    context = _write_dockerfile(
+        tmp_path,
+        f"""
+        FROM {IMAGE}
+        RUN echo start \\
+            && echo middle \\
+            && echo end > /marker.txt
+        CMD ["cat", "/marker.txt"]
+        """,
+    )
+    image, _logs = client.images.build(path=str(context), tag=tag)
+    assert any(tag in (t or "") for t in image.tags)
+
+    output = client.containers.run(tag, remove=True)
+    assert output.strip() == b"end"
+
+
+def test_build_copy_single_file_into_workdir(client: docker.DockerClient, tmp_path: Path) -> None:
+    """COPY <file> . (dest "." with no trailing slash, len(sources) == 1)
+    must still copy *into* WORKDIR, not clobber WORKDIR itself with a file
+    named "app" -- real Docker treats an already-existing directory dest
+    as a directory target regardless of trailing slash. A subsequent
+    COPY <dir>/ <dir>/ into the same WORKDIR is included since it's what
+    exposed the bug: once WORKDIR got overwritten by a file, the next
+    COPY's mkdir underneath it failed with ENOTDIR.
+    """
+    tag = _unique_tag("build-copy-workdir")
+    (tmp_path / "app.txt").write_text("hello from app.txt")
+    (tmp_path / "subdir").mkdir()
+    (tmp_path / "subdir" / "inner.txt").write_text("hello from subdir")
+    _write_dockerfile(
+        tmp_path,
+        f"""
+        FROM {IMAGE}
+        WORKDIR /app
+        COPY app.txt .
+        COPY subdir/ subdir/
+        CMD ["sh", "-c", "cat /app/app.txt && cat /app/subdir/inner.txt"]
+        """,
+    )
+    image, _logs = client.images.build(path=str(tmp_path), tag=tag)
+    output = client.containers.run(tag, remove=True)
+    assert output == b"hello from app.txthello from subdir"
+
+
 def test_build_copy_from_context(client: docker.DockerClient, tmp_path: Path) -> None:
     tag = _unique_tag("build-copy")
     (tmp_path / "app.txt").write_text("hello from context")

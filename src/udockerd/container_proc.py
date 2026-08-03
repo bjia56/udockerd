@@ -61,12 +61,16 @@ _EXTRA_OPT_DEFAULTS: dict[str, Any] = {
 
 
 def apply_default_opt(engine: ExecutionEngineCommon) -> None:
-    # ExecutionEngineCommon.opt is a class-level mutable dict shared by
-    # every engine instance; copy before mutating or state leaks across
-    # unrelated containers. opt["env"] is a Uenv object, not a plain
-    # value, so the dict-level copy alone would still leave every
-    # engine sharing (and mutating) the same Uenv instance.
-    engine.opt = dict(engine.opt)
+    # ExecutionEngineCommon.opt is a class-level dict shared by every
+    # engine instance, and udocker mutates its list-valued defaults in
+    # place (e.g. opt["vol"].extend(...)) rather than reassigning them --
+    # a plain dict() copy still shares those lists, so per-container state
+    # (e.g. hostauth's /etc/passwd+/etc/group bind files) leaks and
+    # accumulates across every container/build the daemon ever runs.
+    engine.opt = {
+        key: list(value) if isinstance(value, list) else value for key, value in engine.opt.items()
+    }
+    # opt["env"] is a Uenv object, not a plain list, so it needs its own copy too.
     engine.opt["env"] = Uenv(engine.opt["env"].list())
     for key, default in _EXTRA_OPT_DEFAULTS.items():
         engine.opt.setdefault(key, default)

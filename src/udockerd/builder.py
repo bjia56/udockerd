@@ -266,7 +266,12 @@ def _join_continuations(text: str) -> list[str]:
             continue
         stripped = line.rstrip()
         if stripped.endswith("\\") and not stripped.endswith("\\\\"):
-            buffer += stripped[:-1] + "\n"
+            # Real Docker elides the backslash+newline entirely, joining
+            # onto one physical line (next line's leading whitespace is
+            # kept as-is) -- not turning it into an embedded "\n", which
+            # would make a later "&& foo" on its own line a shell syntax
+            # error instead of a continuation of the same command.
+            buffer += stripped[:-1]
             continue
         buffer += line
         if buffer.strip():
@@ -490,8 +495,9 @@ def copy_instruction(
     dest_path = _resolve_dest_path(root, workdir, dest)
 
     # Dest is a directory (not a rename target) when there are multiple
-    # sources or the Dockerfile dest ends in "/", matching real Docker.
-    dest_is_dir = len(sources) > 1 or dest.endswith("/")
+    # sources, the Dockerfile dest ends in "/", or dest already exists as
+    # a directory (e.g. WORKDIR-created), matching real Docker.
+    dest_is_dir = len(sources) > 1 or dest.endswith("/") or dest_path.is_dir()
     if dest_is_dir:
         dest_path.mkdir(parents=True, exist_ok=True)
 
@@ -527,10 +533,13 @@ def copy_instruction(
                 extract_tar(src_path, dest_path)
                 continue
 
-            target = dest_path / src_path.name if dest_is_dir else dest_path
             if src_path.is_dir():
-                shutil.copytree(src_path, target, dirs_exist_ok=True)
+                # Docker copies a directory source's *contents* into dest,
+                # never the directory itself -- unlike cp -r, "COPY subdir
+                # dest/" doesn't nest a "subdir" entry inside dest/.
+                shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
             else:
+                target = dest_path / src_path.name if dest_is_dir else dest_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_path, target)
     finally:
@@ -786,6 +795,14 @@ def build(
                         context_dir,
                         stage_containers,
                     )
+                elif instruction.op == "WORKDIR":
+                    apply_metadata_instruction(instruction.op, instruction.args, config)
+                    # Real Docker creates WORKDIR if it doesn't already
+                    # exist; without this, a later single-source COPY into
+                    # it (dest ".", no trailing slash) can't tell it's
+                    # supposed to be a directory and instead copies the
+                    # source's *content* onto that path, clobbering it.
+                    (root / config.WorkingDir.lstrip("/")).mkdir(parents=True, exist_ok=True)
                 else:
                     apply_metadata_instruction(instruction.op, instruction.args, config)
 

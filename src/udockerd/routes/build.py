@@ -84,7 +84,13 @@ def _stream_build(
             target=target,
         ):
             _write_line(ctx, line)
-    except (builder.ParseError, builder.BuildError) as exc:
+    except Exception as exc:  # noqa: BLE001 - headers are already committed (200,
+        # streaming): an uncaught exception here can't become a fresh HTTP
+        # error response, only a malformed second one spliced into the
+        # body (see http.py's _dispatch). Every failure, expected
+        # (BuildError/ParseError) or not (a COPY hitting an OS error
+        # mid-copy, etc), must instead end the stream as one more
+        # Docker-API-shaped error line, same as real docker build does.
         _write_line(ctx, {"errorDetail": {"message": str(exc)}, "error": str(exc)})
 
 

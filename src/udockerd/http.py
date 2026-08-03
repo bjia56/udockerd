@@ -59,6 +59,11 @@ class RequestContext:
     def __init__(self, handler: BaseHTTPRequestHandler, params: dict[str, str]):
         self._handler = handler
         self.params = params
+        # Set once a response line has gone out, so _dispatch's catch-all
+        # exception handler knows a fresh send_response(500) would splice
+        # a second raw HTTP response into an already-committed body
+        # instead of reaching the client as a clean error.
+        self.headers_sent = False
 
     @property
     def path(self) -> str:
@@ -98,11 +103,13 @@ class RequestContext:
         self._handler.send_header("Content-Length", str(len(body)))
         self._handler.end_headers()
         self._handler.wfile.write(body)
+        self.headers_sent = True
 
     def send_empty(self, status: int) -> None:
         self._handler.send_response(status)
         self._handler.send_header("Content-Length", "0")
         self._handler.end_headers()
+        self.headers_sent = True
 
     @property
     def wfile(self) -> BufferedIOBase:
@@ -117,6 +124,7 @@ class RequestContext:
         for key, value in headers.items():
             self._handler.send_header(key, value)
         self._handler.end_headers()
+        self.headers_sent = True
 
     @property
     def headers(self) -> Any:
@@ -140,6 +148,7 @@ class RequestContext:
         self._handler.send_header("Connection", "Upgrade")
         self._handler.send_header("Upgrade", "tcp")
         self._handler.end_headers()
+        self.headers_sent = True
         # Otherwise BaseHTTPRequestHandler tries to parse a next request
         # off the now-raw socket, and clients reading until EOF hang.
         self._handler.close_connection = True
@@ -177,6 +186,15 @@ def make_handler_class(router: Router) -> type[BaseHTTPRequestHandler]:
             try:
                 handler(ctx)
             except Exception as exc:  # noqa: BLE001 - surface as Docker-API-shaped error
+                if ctx.headers_sent:
+                    # A response (or the start of a stream) already went
+                    # out; a fresh send_response(500) here wouldn't reach
+                    # the client as an HTTP response; it'd splice a second
+                    # raw status line into the body of the first one,
+                    # corrupting it. Best effort at this point is to just
+                    # drop the connection instead of a malformed stream.
+                    self.close_connection = True
+                    return
                 body = json.dumps({"message": str(exc)}).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
