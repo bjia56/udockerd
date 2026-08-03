@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
 from udockerd import container_proc
-from udockerd.http import STREAM_STDOUT, stream_frame
 
 if TYPE_CHECKING:
     from udockerd.http import RequestContext, Router
@@ -88,7 +87,10 @@ def start(ctx: RequestContext) -> None:
         exec_proc,
         ctx.wfile,
         ctx.rfile if hijacked else None,
-        frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk),
+        # None: TTY sessions are raw passthrough (frame unused); non-TTY
+        # logfiles already contain pre-framed, correctly-typed mux frames
+        # (see spawn_log_reader), so no re-framing is needed here.
+        frame=None,
         on_stop=ctx.shutdown_read if hijacked else None,
     )
 

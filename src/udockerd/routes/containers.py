@@ -277,9 +277,11 @@ def logs(ctx: RequestContext) -> None:
     ctx.start_streaming(
         200, {"Content-Type": "application/vnd.docker.raw-stream", "Connection": "close"}
     )
-    container_proc.tail_log(
-        proc, ctx.wfile, follow=follow, frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk)
-    )
+    # TTY logfiles are raw pty bytes (single stream, needs mux-framing
+    # here); non-TTY logfiles already contain pre-framed, correctly-typed
+    # mux frames (see container_proc.spawn_log_reader), so pass through as-is.
+    frame = (lambda chunk: stream_frame(STREAM_STDOUT, chunk)) if proc.tty else None
+    container_proc.tail_log(proc, ctx.wfile, follow=follow, frame=frame)
 
 
 def attach(ctx: RequestContext) -> None:
@@ -304,7 +306,10 @@ def attach(ctx: RequestContext) -> None:
         proc,
         ctx.wfile,
         ctx.rfile if hijacked else None,
-        frame=lambda chunk: stream_frame(STREAM_STDOUT, chunk),
+        # None: TTY sessions are raw passthrough (frame unused); non-TTY
+        # logfiles already contain pre-framed, correctly-typed mux frames
+        # (see container_proc.spawn_log_reader), so no re-framing needed.
+        frame=None,
         on_stop=ctx.shutdown_read if hijacked else None,
     )
 

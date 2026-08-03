@@ -31,6 +31,7 @@ from udocker.engine.execmode import ExecutionMode
 from udocker.utils.uenv import Uenv
 
 from udockerd import supervisor, udocker_ctx
+from udockerd.http import STREAM_STDERR, STREAM_STDOUT, stream_frame
 
 if TYPE_CHECKING:
     from udocker.engine.base import ExecutionEngineCommon
@@ -120,11 +121,16 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
             spawn_tty_reader(proc, master_fd)
         else:
             args = _prepend_supervisor(args, supervisor_path, None)
-            log_fh = open(proc.logfile, "ab")  # noqa: SIM115 - closed via Popen's fd ownership
-            kwargs["stdout"] = log_fh
-            kwargs["stderr"] = log_fh
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
             popen_proc = original_popen(*args, **kwargs)  # noqa: S603
-            log_fh.close()  # Popen dup'd the fd; safe to close our copy
+            # stdout/stderr kept as separate pipes (not one merged fd) so
+            # each chunk can be tagged with its real stream type; the
+            # logfile stores the docker mux-frame bytes directly (header +
+            # payload) rather than plain text, so tail_log can stream it
+            # straight through without knowing which stream each byte was.
+            spawn_log_reader(proc, popen_proc.stdout, STREAM_STDOUT)
+            spawn_log_reader(proc, popen_proc.stderr, STREAM_STDERR)
         with proc.lock:
             proc.pid = popen_proc.pid
             # Not os.getpgid(): supervisor's setsid() races a fresh
@@ -152,6 +158,10 @@ class ContainerProc:
     # instead of the exception only reaching the daemon's own stderr.
     error: str | None = None
     logfile: str = ""
+    # Guards logfile writes: non-TTY containers have two reader threads
+    # (stdout/stderr) appending to the same file, and a torn write would
+    # interleave one chunk's frame header with another chunk's payload.
+    log_lock: threading.Lock = field(default_factory=threading.Lock)
     started_at: float = 0.0
     finished_at: float = 0.0
     # engine.opt overrides captured at /containers/create time, applied
@@ -341,6 +351,26 @@ def stop_all(grace_seconds: float = 10.0) -> None:
     """Sweeps all running containers; called from the daemon's SIGTERM handler."""
     for proc in registry.all():
         stop(proc, grace_seconds)
+
+
+def spawn_log_reader(proc: ContainerProc, pipe: Any, stream_type: int) -> None:
+    """One reader thread per non-TTY stdout/stderr pipe: tags each chunk
+    with its real stream type and appends the framed bytes to the shared
+    logfile, so a later tail_log() can stream the file straight through
+    without needing to know which stream any given byte came from.
+    """
+
+    def reader() -> None:
+        with pipe, open(proc.logfile, "ab") as logf:
+            while True:
+                chunk = pipe.read(65536)
+                if not chunk:
+                    break
+                with proc.log_lock:
+                    logf.write(stream_frame(stream_type, chunk))
+                    logf.flush()
+
+    threading.Thread(target=reader, daemon=True).start()
 
 
 def spawn_tty_reader(proc: ContainerProc, master_fd: int) -> None:
