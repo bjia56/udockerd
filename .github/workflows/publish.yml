@@ -1,0 +1,90 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      test_pypi:
+        description: 'Publish to Test PyPI instead of production'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  # Call the build workflow to build wheels
+  build:
+    uses: ./.github/workflows/build.yml
+
+  # Publish the wheels to PyPI
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.test_pypi == 'true') && 'testpypi' || 'pypi' }}
+      url: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.test_pypi == 'true') && 'https://test.pypi.org/p/' || 'https://pypi.org/p/' }}${{ github.event.repository.name }}
+    permissions:
+      id-token: write  # For trusted publishing
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install twine
+        run: pip install twine
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheels
+          path: dist/
+
+      - name: List distribution files
+        run: ls -lh dist/
+
+      - name: Check distribution files
+        run: twine check dist/*
+
+      - name: Publish to Test PyPI
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_pypi == 'true'
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Publish to PyPI
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_pypi != 'true')
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+
+  # Attach build outputs to the GitHub release
+  upload_release_assets:
+    name: Upload release assets
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # For uploading release assets
+
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheels
+          path: dist/
+
+      - name: Download cosmo binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: udockerd-unknown-unknown
+          path: dist/
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --clobber
