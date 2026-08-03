@@ -46,7 +46,7 @@ jobs:
 
       - name: Get Cosmopolitan Python
         run: |
-          wget https://github.com/bjia56/portable-python/releases/download/cpython-v3.13.10-beta.1/python-3.13.10t-cosmo-unknown.zip -O python-cosmo.zip
+          wget -q https://github.com/bjia56/portable-python/releases/download/cpython-v3.13.10-beta.1/python-3.13.10t-cosmo-unknown.zip -O python-cosmo.zip
           unzip -p python-cosmo.zip "python-3.13.10t-cosmo-unknown/bin/python.standalone.com" > python.exe
           chmod +x python.exe
 
@@ -125,7 +125,7 @@ jobs:
             "blink-tiny-linux-s390x-stripped blink-linux-s390x"
           do
             set -- $item
-            wget "https://github.com/bjia56/blinkverse/releases/download/v8/$1" -O "$2"
+            wget -q "https://github.com/bjia56/blinkverse/releases/download/v8/$1" -O "$2"
             chmod +x "$2"
             if [[ "$2" == "blink-linux-powerpc64le" || "$2" == "blink-linux-i386" ]]; then
               upx --best "$2"
@@ -134,11 +134,11 @@ jobs:
 
       - name: Chimplink
         run: |
-          wget https://github.com/bjia56/chimp/releases/download/v0.12.0/chimplink
+          wget -q https://github.com/bjia56/chimp/releases/download/v0.12.0/chimplink
           chmod +x chimplink
 
-          wget https://cosmo.zip/pub/cosmos/bin/ape-aarch64.elf
-          wget https://cosmo.zip/pub/cosmos/bin/ape-x86_64.elf
+          wget -q https://cosmo.zip/pub/cosmos/bin/ape-aarch64.elf
+          wget -q https://cosmo.zip/pub/cosmos/bin/ape-x86_64.elf
 
           sha256=$(sha256sum udockerd.exe | cut -d ' ' -f 1)
           ./chimplink udockerd.exe udockerd-unknown-unknown ${{ github.sha }} \
@@ -151,6 +151,7 @@ jobs:
       - name: Verify binary
         run: |
           ./udockerd-unknown-unknown --help
+          ./udockerd-unknown-unknown --version
 
       - name: Smoke test container lifecycle (native x86_64)
         run: |
