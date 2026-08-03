@@ -133,8 +133,21 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
             # logfile stores the docker mux-frame bytes directly (header +
             # payload) rather than plain text, so tail_log can stream it
             # straight through without knowing which stream each byte was.
-            spawn_log_reader(proc, popen_proc.stdout, STREAM_STDOUT)
-            spawn_log_reader(proc, popen_proc.stderr, STREAM_STDERR)
+            #
+            # engine.run() calls subprocess.call() internally, whose
+            # `with Popen(...) as p:` closes p.stdout/p.stderr the instant
+            # p.wait() sees the child exit -- racing the log reader threads
+            # below, which may still be draining buffered output on those
+            # same file objects (ValueError: read of closed file, and
+            # potential loss of the tail of the container's output). Reader
+            # threads get their own duped fds so that close only affects
+            # popen_proc's handles, not theirs.
+            assert popen_proc.stdout is not None  # noqa: S101 - guaranteed by stdout=PIPE above
+            assert popen_proc.stderr is not None  # noqa: S101 - guaranteed by stderr=PIPE above
+            stdout_pipe = os.fdopen(os.dup(popen_proc.stdout.fileno()), "rb")
+            stderr_pipe = os.fdopen(os.dup(popen_proc.stderr.fileno()), "rb")
+            spawn_log_reader(proc, stdout_pipe, STREAM_STDOUT)
+            spawn_log_reader(proc, stderr_pipe, STREAM_STDERR)
         with proc.lock:
             proc.pid = popen_proc.pid
             # Not os.getpgid(): supervisor's setsid() races a fresh

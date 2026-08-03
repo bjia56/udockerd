@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import queue
 import shlex
@@ -582,7 +583,13 @@ def run_instruction(
             kwargs["stdout"] = subprocess.PIPE
             kwargs["stderr"] = subprocess.STDOUT
             popen_proc = original_popen(*args, **kwargs)  # noqa: S603
-            threading.Thread(target=reader, args=(popen_proc.stdout,), daemon=True).start()
+            # See container_proc.py's spawn(): engine.run()'s internal
+            # subprocess.call() closes popen_proc.stdout the instant it
+            # sees the child exit, racing this reader thread. Duping the
+            # fd means that close only affects popen_proc's own handle.
+            assert popen_proc.stdout is not None  # noqa: S101 - guaranteed by stdout=PIPE above
+            reader_pipe = os.fdopen(os.dup(popen_proc.stdout.fileno()), "rb")
+            threading.Thread(target=reader, args=(reader_pipe,), daemon=True).start()
             return popen_proc
 
         return patched_popen
