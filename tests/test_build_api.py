@@ -59,6 +59,39 @@ def test_build_single_stage(client: docker.DockerClient, tmp_path: Path) -> None
     assert output.strip() == b"building"
 
 
+def test_build_distinct_content_gets_distinct_image_id(
+    client: docker.DockerClient, tmp_path: Path
+) -> None:
+    """Two builds with identical Config (same Cmd, no ENV/LABEL diff) but
+    different RUN-produced file content must still get different image
+    IDs. The config JSON's digest (the image ID) has no other way to
+    depend on layer content -- without a rootfs.diff_ids field tying it
+    to the actual layer, two such builds landing in the same wall-clock
+    "created" second would hash identically and collide, corrupting
+    both images' tag->ID mapping (confirmed against a live harness: the
+    second build's own client-side Image object came back holding the
+    first build's tag).
+    """
+    dockerfile = f"""
+    FROM {IMAGE}
+    RUN echo {{content}} > /marker.txt
+    CMD ["cat", "/marker.txt"]
+    """
+    tag_a = _unique_tag("build-distinct-a")
+    context_a = _write_dockerfile(tmp_path, dockerfile.format(content="content-a"))
+    image_a, _ = client.images.build(path=str(context_a), tag=tag_a)
+
+    tmp_path_b = tmp_path / "b"
+    tmp_path_b.mkdir()
+    tag_b = _unique_tag("build-distinct-b")
+    context_b = _write_dockerfile(tmp_path_b, dockerfile.format(content="content-b"))
+    image_b, _ = client.images.build(path=str(context_b), tag=tag_b)
+
+    assert image_a.id != image_b.id
+    assert any(tag_a in (t or "") for t in image_a.tags)
+    assert any(tag_b in (t or "") for t in image_b.tags)
+
+
 def test_build_run_multiline_continuation(client: docker.DockerClient, tmp_path: Path) -> None:
     """Backslash-continued RUN lines must join onto one shell command, not
     one with an embedded newline -- a bare "&& foo" on its own line is a

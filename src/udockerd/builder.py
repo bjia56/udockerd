@@ -669,6 +669,14 @@ def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str
             "os": "linux",
             "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "config": config.to_image_config(),
+            # Without this, the config (and so the image ID, which is its
+            # digest) doesn't depend on the layer at all -- two builds
+            # with identical Cmd/Env/etc metadata but different file
+            # content would hash to the same ID whenever they also landed
+            # in the same "created" second. FileUtil().tar() writes a
+            # plain (uncompressed) tar, so the diff_id (digest of the
+            # uncompressed layer) is just layer_digest.
+            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
         }
         config_bytes = json.dumps(config_json).encode("utf-8")
         config_digest = f"sha256:{hashlib.sha256(config_bytes).hexdigest()}"
