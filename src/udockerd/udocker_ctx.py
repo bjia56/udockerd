@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from udocker.config import Config
 from udocker.container.localrepo import LocalRepository
 from udocker.docker import DockerIoAPI
+from udocker.msg import Msg
 from udocker.tools import UdockerTools
 
 
@@ -33,7 +34,21 @@ _context: UdockerContext | None = None
 _context_lock = threading.Lock()
 
 
-def init() -> UdockerContext:
+def _udocker_msg_level(verbose: int, quiet: bool) -> int:
+    """Mirror __main__.py's -v/-q -> logging level mapping onto udocker's
+    own Msg verbosity, since they're separate systems udocker doesn't log
+    through the stdlib `logging` module at all.
+    """
+    if quiet:
+        return int(Msg.WAR)
+    if verbose >= 2:  # noqa: PLR2004
+        return int(Msg.DBG)
+    if verbose == 1:
+        return int(Msg.VER)
+    return int(Msg.INF)
+
+
+def init(verbose: int = 0, quiet: bool = False) -> UdockerContext:
     """Idempotent: safe to call more than once, or concurrently, though in
     practice it's only ever called once at startup before serving requests.
     """
@@ -43,6 +58,12 @@ def init() -> UdockerContext:
             return _context
 
         Config().getconf()
+        # udocker only relays subprocess (tar/find, etc) stderr instead of
+        # swallowing it to /dev/null when Msg.level >= Msg.DBG; below that,
+        # failures like "Error: while extracting image layer" print with no
+        # detail about what actually went wrong. Gated behind -vv rather
+        # than always-on so default output stays as quiet as before.
+        Msg().setlevel(_udocker_msg_level(verbose, quiet))
         # Only proot/fakechroot are supported (no root, no namespaces/cgroups
         # on Termux); default_execution_modes otherwise falls back to 'R1'
         # (runc) for unrecognized/DEFAULT and ppc64le arches, which isn't

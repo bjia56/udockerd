@@ -90,7 +90,7 @@ def main() -> int:
     check_linux()
     check_curl_available()
     configure_udocker(args.data_dir)
-    udocker_ctx.init()
+    udocker_ctx.init(verbose=args.verbose, quiet=args.quiet)
 
     logger.info("udockerd %s starting on %s:%d", __version__, args.host, args.port)
     serve(args.host, args.port)
