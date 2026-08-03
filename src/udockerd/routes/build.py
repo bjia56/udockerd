@@ -37,11 +37,10 @@ def build(ctx: RequestContext) -> None:
     labels = _parse_json_param(query, "labels")
     target = query.get("target", [None])[0]
 
-    body = ctx.read_body()
     context_dir = Path(tempfile.mkdtemp(prefix="udockerd-build-"))
     try:
         context_tar = context_dir / ".context.tar"
-        context_tar.write_bytes(body)
+        ctx.stream_body_to_file(context_tar)
         try:
             builder.extract_tar(context_tar, context_dir)
         except builder.BuildError as exc:

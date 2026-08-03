@@ -14,9 +14,12 @@ import struct
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BufferedIOBase
-from typing import Any
+from pathlib import Path
+from typing import Any, BinaryIO
 
 import udockerd
+
+_COPY_BUF_SIZE = 65536
 
 RouteHandler = Callable[["RequestContext"], None]
 Route = tuple[str, "re.Pattern[str]", RouteHandler]
@@ -91,6 +94,42 @@ class RequestContext:
             chunks.append(rfile.read(size))
             rfile.readline()
         return b"".join(chunks)
+
+    def stream_body_to_file(self, dest: Path) -> None:
+        """Writes the request body straight to dest instead of buffering
+        the whole thing in memory first (read_body() + write_bytes()) --
+        build contexts can be large tarballs, and this runs on
+        memory-constrained devices (Termux/Android).
+        """
+        with open(dest, "wb") as f:
+            if self._handler.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                self._stream_chunked_body_to_file(f)
+                return
+            remaining = int(self._handler.headers.get("Content-Length", 0) or 0)
+            while remaining > 0:
+                chunk = self._handler.rfile.read(min(_COPY_BUF_SIZE, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+
+    def _stream_chunked_body_to_file(self, f: BinaryIO) -> None:
+        rfile = self._handler.rfile
+        while True:
+            size_line = rfile.readline().strip()
+            size = int(size_line.split(b";", 1)[0], 16)
+            if size == 0:
+                while rfile.readline().strip():
+                    pass
+                break
+            remaining = size
+            while remaining > 0:
+                chunk = rfile.read(min(_COPY_BUF_SIZE, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+            rfile.readline()
 
     def read_json(self) -> Any:
         body = self.read_body()
