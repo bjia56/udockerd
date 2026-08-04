@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from udocker.container.structure import ContainerStructure
 from udocker.engine.execmode import ExecutionMode
 from udocker.helper.hostinfo import HostInfo
-from udocker.utils.fileutil import FileUtil
+from udocker.msg import Msg
 
 from udockerd import udocker_ctx
 from udockerd.container_proc import (
@@ -640,6 +640,51 @@ _CONFIG_MEDIA_TYPE = "application/vnd.docker.container.image.v1+json"
 _LAYER_MEDIA_TYPE = "application/vnd.docker.image.rootfs.diff.tar.gzip"
 
 
+_TAR_UNKNOWN_OPTION_PHRASES = (
+    "unknown option",
+    "unrecognized option",
+    "invalid option",
+    "illegal option",
+)
+
+
+def _create_layer_tar(sourcedir: Path, tarfile: Path) -> None:
+    """Flattens sourcedir into an uncompressed tar at tarfile.
+
+    --one-file-system/-S/--xattrs are GNU-tar-only and not universally
+    supported -- e.g. Termux's tar rejects --xattrs at runtime even
+    though it's listed in `tar --help`, so a --help-based capability
+    probe can't be trusted. Try with all three, and on a failure whose
+    stderr reads like an unknown-option complaint, retry with them
+    progressively dropped (least essential first) until one works or
+    none are left. A failure that doesn't look option-related (disk
+    full, permission denied, etc) is raised immediately.
+
+    stderr is always captured (needed to make the retry decision above),
+    then relayed through Msg.chlderr so it still reaches udockerd's own
+    console/logs at -vv+ same as every other udocker-driven subprocess
+    (see udocker_ctx._patch_msg_verbose_child_output); below that it's
+    swallowed to /dev/null like before. Verbose file-listing output
+    (`-v`) is added at the same -vv threshold and left to inherit stdout
+    directly, matching udocker's own tar invocations.
+    """
+    verbose = "v" if Msg.level >= Msg.VER else ""
+    flags = ["--one-file-system", "-S", "--xattrs"]
+    while True:
+        cmd = ["tar", "-C", str(sourcedir), "-c" + verbose, *flags, "-f", str(tarfile), "."]
+        proc = subprocess.run(cmd, stderr=subprocess.PIPE, close_fds=True, check=False)
+        stderr_text = proc.stderr.decode(errors="replace") if proc.stderr else ""
+        if stderr_text:
+            Msg.chlderr.write(stderr_text)
+        if proc.returncode == 0:
+            return
+        if flags and any(phrase in stderr_text.lower() for phrase in _TAR_UNKNOWN_OPTION_PHRASES):
+            flags.pop()
+            continue
+        detail = stderr_text.strip() or f"tar exited {proc.returncode}"
+        raise BuildError(f"failed to create image layer tar: {detail}")
+
+
 def _sha256_digest(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as f:
@@ -664,8 +709,7 @@ def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str
 
     with tempfile.TemporaryDirectory() as tmp:
         layer_tar = Path(tmp) / "layer.tar"
-        if not FileUtil().tar(str(layer_tar), sourcedir=str(root)):
-            raise BuildError("failed to create image layer tar")
+        _create_layer_tar(root, layer_tar)
         layer_digest = _sha256_digest(layer_tar)
         layer_size = layer_tar.stat().st_size
 
@@ -680,7 +724,7 @@ def commit_layer(container_id: str, config: StageConfig, tags: list[str]) -> str
             # digest) doesn't depend on the layer at all -- two builds
             # with identical Cmd/Env/etc metadata but different file
             # content would hash to the same ID whenever they also landed
-            # in the same "created" second. FileUtil().tar() writes a
+            # in the same "created" second. _create_layer_tar() writes a
             # plain (uncompressed) tar, so the diff_id (digest of the
             # uncompressed layer) is just layer_digest.
             "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
