@@ -27,6 +27,8 @@ from udocker.msg import Msg
 from udocker.tools import UdockerTools
 from udocker.utils.fileutil import FileUtil
 
+from udockerd.config import is_termux
+
 
 @dataclass
 class UdockerContext:
@@ -71,6 +73,17 @@ def _resolve_proot_executable(local: LocalRepository) -> str | None:
     return None
 
 
+def _capable_proot_executable(local: LocalRepository) -> str | None:
+    """Resolved proot binary, but only if it actually supports
+    --link2symlink -- otherwise None, so callers can treat "no usable
+    proot" and "proot without the flag" identically.
+    """
+    proot_exec = _resolve_proot_executable(local)
+    if proot_exec and HostInfo().cmd_has_option(proot_exec, "--link2symlink"):
+        return proot_exec
+    return None
+
+
 def _patch_untar_layers_proot_retry(local: LocalRepository) -> None:
     """ContainerStructure._untar_layers runs a bare `tar -x` directly on
     the host (no proot involved -- that only wraps the container's own
@@ -100,18 +113,30 @@ def _patch_untar_layers_proot_retry(local: LocalRepository) -> None:
     def _patched_untar_layers(
         self: ContainerStructure, tarfiles: list[str], destdir: str
     ) -> bool:
-        status = bool(original_untar_layers(self, tarfiles, destdir))
+        proot_exec = _capable_proot_executable(local)
+
+        # On Termux the bare-tar attempt is known to fail on any layer
+        # carrying a hardlink member (SELinux rejects hardlink()), so skip
+        # straight to the proot-wrapped retry instead of paying for a
+        # doomed first pass -- but only once a capable proot is confirmed,
+        # so a Termux host without one still gets the real attempt rather
+        # than an unconditional false failure. Elsewhere, only pay for the
+        # retry on failure.
+        if is_termux() and proot_exec:
+            status = False
+        else:
+            status = bool(original_untar_layers(self, tarfiles, destdir))
         if status or not tarfiles:
             return status
 
-        proot_exec = _resolve_proot_executable(local)
-        if not proot_exec or not HostInfo().cmd_has_option(proot_exec, "--link2symlink"):
+        if not proot_exec:
             return status
 
         Msg().out(
-            "Info: retrying layer extraction under",
+            "Info: extracting layer under",
             proot_exec,
-            "--link2symlink (host rejected a hardlink)",
+            "--link2symlink"
+            + ("" if is_termux() else " (host rejected a hardlink)"),
             l=Msg.INF,
         )
         optional_flags = ["--wildcards", "--delay-directory-restore"]
