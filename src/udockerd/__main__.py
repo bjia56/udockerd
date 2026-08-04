@@ -2,6 +2,10 @@ import argparse
 import logging
 import os
 import sys
+import typing
+
+if typing.TYPE_CHECKING:
+    import io
 
 from udockerd import __version__, udocker_ctx
 from udockerd.config import check_curl_available, check_linux, configure_udocker
@@ -84,6 +88,12 @@ def configure_logging(verbose: int, quiet: bool) -> None:
 
 
 def main() -> int:
+    # udocker's Msg class writes to stdout/stderr with no flush(); Python
+    # full-buffers those when not a tty (backgrounded), delaying output.
+    # Force line buffering so it behaves like a tty either way.
+    typing.cast("io.TextIOWrapper", sys.stdout).reconfigure(line_buffering=True)
+    typing.cast("io.TextIOWrapper", sys.stderr).reconfigure(line_buffering=True)
+
     args = build_parser().parse_args()
     configure_logging(args.verbose, args.quiet)
 
