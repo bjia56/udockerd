@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -197,6 +198,30 @@ def _patch_untar_layers_proot_retry(local: LocalRepository) -> None:
     ContainerStructure._untar_layers = _patched_untar_layers  # noqa: SLF001
 
 
+def _patch_msg_verbose_child_output() -> None:
+    """Msg.__init__ fires on every bare `Msg()` call (hundreds of sites in
+    udocker) and unconditionally resets chlderr/chldout to /dev/null,
+    ignoring Msg.level. That silently undoes verbose subprocess-stderr
+    relaying (e.g. FileUtil.tar() failures in builder.py's commit_layer
+    print no detail) after the next unrelated Msg() call.
+
+    Keep chlderr/chldout synced to current level instead. Gated on
+    Msg.VER (-vv), matching udocker's own `tar -v` threshold
+    (structure.py's _untar_layers, our proot-retry patch above) -- one
+    step below Msg.DBG, which -vvv reserves for proot's own "-v 9" trace
+    (gated separately in engine/proot.py, untouched here).
+    """
+    original_init = Msg.__init__
+
+    def _patched_init(self: Msg, new_level: int | None = None) -> None:
+        original_init(self, new_level)
+        if Msg.level >= Msg.VER:
+            Msg.chlderr = sys.stderr
+            Msg.chldout = sys.stdout
+
+    Msg.__init__ = _patched_init
+
+
 def init(verbose: int = 0, quiet: bool = False) -> UdockerContext:
     """Idempotent: safe to call more than once, or concurrently, though in
     practice it's only ever called once at startup before serving requests.
@@ -206,12 +231,12 @@ def init(verbose: int = 0, quiet: bool = False) -> UdockerContext:
         if _context is not None:
             return _context
 
+        _patch_msg_verbose_child_output()
+
         Config().getconf()
-        # udocker only relays subprocess (tar/find, etc) stderr instead of
-        # swallowing it to /dev/null when Msg.level >= Msg.DBG; below that,
-        # failures like "Error: while extracting image layer" print with no
-        # detail about what actually went wrong. Gated behind -vv rather
-        # than always-on so default output stays as quiet as before.
+        # Relays subprocess (tar/find, etc) stderr at -vv+ instead of
+        # swallowing it to /dev/null (see _patch_msg_verbose_child_output);
+        # below that, failures print no detail about what went wrong.
         Msg().setlevel(_udocker_msg_level(verbose, quiet))
         # Only proot/fakechroot are supported (no root, no namespaces/cgroups
         # on Termux); default_execution_modes otherwise falls back to 'R1'
