@@ -46,7 +46,7 @@ jobs:
 
       - name: Get Cosmopolitan Python
         run: |
-          wget -q https://github.com/bjia56/portable-python/releases/download/cpython-v3.13.10-beta.1/python-3.13.10t-cosmo-unknown.zip -O python-cosmo.zip
+          wget -q https://github.com/bjia56/portable-python/releases/download/cpython-v3.13.10-beta.2/python-3.13.10t-cosmo-unknown.zip -O python-cosmo.zip
           unzip -p python-cosmo.zip "python-3.13.10t-cosmo-unknown/bin/python.standalone.com" > python.exe
           chmod +x python.exe
 
