@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="count",
         default=0,
-        help="increase log verbosity (-v: info, -vv: debug)",
+        help="increase log verbosity (-v: info, -vv: debug, -vvv: debug + proot trace)",
     )
     parser.add_argument(
         "-q",

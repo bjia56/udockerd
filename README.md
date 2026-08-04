@@ -32,7 +32,7 @@ options:
   --host HOST      address to bind to (env: UDOCKERD_HOST, default: 127.0.0.1)
   --port PORT      port to listen on (env: UDOCKERD_PORT, default: 2375)
   --data-dir DIR   udocker data directory for images/containers/layers (env: UDOCKER_DIR, default: ~/.udocker)
-  -v, --verbose    increase log verbosity (-v: info, -vv: debug)
+  -v, --verbose    increase log verbosity (-v: info, -vv: debug, -vvv: debug + proot trace)
   -q, --quiet      suppress all logging except warnings and errors
   --version        show program's version number and exit
 

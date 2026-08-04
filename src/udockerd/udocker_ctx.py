@@ -45,12 +45,21 @@ def _udocker_msg_level(verbose: int, quiet: bool) -> int:
     """Mirror __main__.py's -v/-q -> logging level mapping onto udocker's
     own Msg verbosity, since they're separate systems udocker doesn't log
     through the stdlib `logging` module at all.
+
+    Msg.DBG is one step spicier here than daemon-log DEBUG: udocker's
+    PRootEngine.run() (engine/proot.py) gates proot's own "-v 9" trace flag
+    on `Msg.level >= Msg.DBG`, and that flag makes proot -- which *is* the
+    container's process -- dump trace output onto the container's own
+    stderr, visible to the docker client via logs/attach. -vv should still
+    get daemon-side DEBUG without also leaking proot tracing into container
+    output, so Msg.DBG (and the proot trace it triggers) is reserved for
+    -vvv.
     """
     if quiet:
         return int(Msg.WAR)
-    if verbose >= 2:  # noqa: PLR2004
+    if verbose >= 3:  # noqa: PLR2004
         return int(Msg.DBG)
-    if verbose == 1:
+    if verbose >= 1:
         return int(Msg.VER)
     return int(Msg.INF)
 
