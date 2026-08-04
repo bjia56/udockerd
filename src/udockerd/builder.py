@@ -244,9 +244,11 @@ def apply_metadata_instruction(op: str, args: str, config: StageConfig) -> None:
         for volume in volumes:
             config.Volumes[volume] = {}
     elif op == "CMD":
-        config.Cmd = _exec_form_cmd(args) or _shell_form_cmd(args)
+        exec_form = _exec_form_cmd(args)
+        config.Cmd = exec_form if exec_form is not None else _shell_form_cmd(args)
     elif op == "ENTRYPOINT":
-        config.Entrypoint = _exec_form_cmd(args) or _shell_form_cmd(args)
+        exec_form = _exec_form_cmd(args)
+        config.Entrypoint = exec_form if exec_form is not None else _shell_form_cmd(args)
 
 
 def _strip_comment(line: str) -> str:

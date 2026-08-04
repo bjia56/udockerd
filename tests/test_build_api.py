@@ -59,6 +59,26 @@ def test_build_single_stage(client: docker.DockerClient, tmp_path: Path) -> None
     assert output.strip() == b"building"
 
 
+def test_build_cmd_empty_array_stays_exec_form(
+    client: docker.DockerClient, tmp_path: Path
+) -> None:
+    """CMD [] / ENTRYPOINT [] is valid exec-form syntax for "no args", not
+    a shell-form string "[]" wrapped in /bin/sh -c.
+    """
+    tag = _unique_tag("build-cmd-empty")
+    context = _write_dockerfile(
+        tmp_path,
+        f"""
+        FROM {IMAGE}
+        ENTRYPOINT ["true"]
+        CMD []
+        """,
+    )
+    image, _logs = client.images.build(path=str(context), tag=tag)
+    assert image.attrs["Config"]["Cmd"] in (None, [])
+    assert image.attrs["Config"]["Entrypoint"] == ["true"]
+
+
 def test_build_distinct_content_gets_distinct_image_id(
     client: docker.DockerClient, tmp_path: Path
 ) -> None:
