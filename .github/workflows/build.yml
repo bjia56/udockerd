@@ -153,11 +153,17 @@ jobs:
           ./udockerd-unknown-unknown --help
           ./udockerd-unknown-unknown --version
 
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: udockerd-unknown-unknown
+          path: udockerd-unknown-unknown
+
       - name: Smoke test container lifecycle (native x86_64)
         run: |
           # Exercises the bundled exe itself (cosmo runtime, not CPython).
           # Native x86_64 only — blink-emulated arches add no extra signal.
-          ./udockerd-unknown-unknown --host 127.0.0.1 --port 2375 &
+          ./udockerd-unknown-unknown -vv --host 127.0.0.1 --port 2375 &
           UDOCKERD_PID=$!
           trap 'kill "$UDOCKERD_PID" 2>/dev/null || true' EXIT
 
@@ -179,9 +185,3 @@ jobs:
           output=$(docker run --rm alpine:latest echo hello-from-udockerd)
           echo "$output"
           [ "$output" = "hello-from-udockerd" ]
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: udockerd-unknown-unknown
-          path: udockerd-unknown-unknown
