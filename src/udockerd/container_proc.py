@@ -116,7 +116,15 @@ def _make_patched_popen(proc: ContainerProc, supervisor_path: str, unpatch: Any)
             master_fd, slave_fd = pty.openpty()
             with proc.pty_lock:
                 proc.pty_master_fd = master_fd
-            tty_slave_path = os.ttyname(slave_fd)
+            try:
+                tty_slave_path = os.ttyname(slave_fd)
+            except OSError:
+                # os.ttyname() throws EINVAL under Cosmopolitan libc on
+                # Android even though the fd itself is a perfectly good pty
+                # slave (pty.openpty() above succeeded) -- ttyname()'s own
+                # implementation is the broken part, not the fd. Fall back
+                # to resolving the same path via /proc instead.
+                tty_slave_path = os.readlink(f"/proc/self/fd/{slave_fd}")
             os.close(slave_fd)  # supervisor's forked child reopens it after its own setsid
             args = _prepend_supervisor(args, supervisor_path, tty_slave_path)
             # No stdin/stdout/stderr kwargs: supervisor.c's own dup2()
