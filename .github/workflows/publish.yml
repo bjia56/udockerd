@@ -85,6 +85,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # sdist excluded: GitHub already attaches a source tarball to every
+          # release automatically, so the built sdist here would be redundant.
+          rm -f dist/*.tar.gz
           gh release upload "${{ github.event.release.tag_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --clobber
