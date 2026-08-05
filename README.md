@@ -24,7 +24,7 @@ multiplatform executable, requiring no host Python dependency at runtime.
 
 ```
 $ udockerd --help
-usage: udockerd [-h] [--host HOST] [--port PORT] [--data-dir DIR] [-v] [-q] [--version]
+usage: udockerd [-h] [--host HOST] [--port PORT] [--data-dir DIR] [--dns IP] [-v] [-q] [--version]
 
 Docker Engine API-compatible daemon backed by udocker.
 Runs proot/fakechroot containers with no root, no namespaces, no cgroups.
@@ -34,6 +34,8 @@ options:
   --host HOST      address to bind to (env: UDOCKERD_HOST, default: 127.0.0.1)
   --port PORT      port to listen on (env: UDOCKERD_PORT, default: 2375)
   --data-dir DIR   udocker data directory for images/containers/layers (env: UDOCKER_DIR, default: ~/.udocker)
+  --dns IP         nameserver for containers' /etc/resolv.conf (repeatable; env: UDOCKERD_DNS,
+                   comma-separated; default: 8.8.8.8, 8.8.4.4)
   -v, --verbose    increase log verbosity (-v: info, -vv: debug, -vvv: debug + proot trace)
   -q, --quiet      suppress all logging except warnings and errors
   --version        show program's version number and exit

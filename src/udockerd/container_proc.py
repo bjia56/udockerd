@@ -74,6 +74,9 @@ def apply_default_opt(engine: ExecutionEngineCommon) -> None:
     engine.opt["env"] = Uenv(engine.opt["env"].list())
     for key, default in _EXTRA_OPT_DEFAULTS.items():
         engine.opt.setdefault(key, default)
+    # See udocker_ctx.new_resolv_conf(): host has no /etc/resolv.conf on
+    # Termux/Android, so udocker's own sysdirs bind for it silently no-ops.
+    engine.opt["vol"].append(f"{udocker_ctx.new_resolv_conf()}:/etc/resolv.conf")
 
 
 def apply_engine_opt(engine: ExecutionEngineCommon, opt: dict[str, Any]) -> None:

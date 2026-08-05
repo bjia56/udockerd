@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(env: UDOCKER_DIR, default: ~/.udocker)",
     )
     parser.add_argument(
+        "--dns",
+        action="append",
+        metavar="IP",
+        help="nameserver for containers' /etc/resolv.conf (repeatable; "
+        "env: UDOCKERD_DNS, comma-separated; default: 8.8.8.8, 8.8.4.4)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -106,6 +113,10 @@ def main() -> int:
     check_curl_available()
     check_tar_available()
     configure_udocker(args.data_dir)
+    dns_servers = args.dns or [
+        s for s in os.environ.get("UDOCKERD_DNS", "").split(",") if s
+    ]
+    udocker_ctx.set_dns_servers(dns_servers)
     udocker_ctx.init(verbose=args.verbose, quiet=args.quiet)
 
     logger.info("udockerd %s starting on %s:%d", __version__, args.host, args.port)

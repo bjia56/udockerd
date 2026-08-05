@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -403,3 +404,33 @@ def resolve_imagerepo(uctx: UdockerContext, imagerepo: str, tag: str) -> tuple[s
         if candidate != imagerepo and uctx.local.cd_imagerepo(candidate, tag):
             return candidate, tag
     return None
+
+
+_dns_servers: list[str] = ["8.8.8.8", "8.8.4.4"]
+
+
+def set_dns_servers(servers: list[str]) -> None:
+    """Overrides the default nameservers written by new_resolv_conf().
+    Must be called before the first container runs (main() calls it at
+    startup, before serve()).
+    """
+    global _dns_servers
+    if servers:
+        _dns_servers = servers
+
+
+def new_resolv_conf() -> str:
+    """Returns path to a freshly-written resolv.conf, bound onto a
+    container's /etc/resolv.conf (host has none on Termux/Android, so
+    udocker's own sysdirs bind for it silently no-ops). One file per call,
+    not shared: proot's `-b` bind has no read-only mode, so a container
+    writing to /etc/resolv.conf would otherwise corrupt a shared file for
+    every other container. Mirrors udocker's own per-run tmp passwd/group
+    bind files (NixAuthentication).
+    """
+    fd, path = tempfile.mkstemp(
+        prefix="udockerd-resolv-", suffix=".conf", dir=Config.conf["tmpdir"]
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(f"nameserver {server}\n" for server in _dns_servers)
+    return path
