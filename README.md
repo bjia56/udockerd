@@ -12,7 +12,8 @@ directly on Termux, or inside a `proot-distro` guest, and talks to it over `DOCK
 pip install udockerd
 ```
 
-Requires Python 3.12+ and a `curl` executable on `PATH` (Termux: `pkg install curl`, often preinstalled elsewhere).
+Requires Python 3.12+ and `curl`/`tar` executables on `PATH` (Termux: `pkg install curl tar`, often preinstalled
+elsewhere).
 udocker downloads its own proot/fakechroot execution backends the first time it needs them, however on Termux it is
 strongly recommended to install the official Termux proot package for best compatibility.
 
@@ -88,7 +89,7 @@ container process to prevent orphaned processes when the daemon exits.
 
 The daemon itself is pure Python, stdlib plus pure-Python `udocker`, which is what makes it possible to bundle into
 a single Cosmopolitan Libc executable with no C extensions anywhere in the import graph. Native runtime
-dependencies like `curl`, proot, fakechroot, and a C compiler for the supervisor stay external, fetched or invoked
+dependencies like `curl`, `tar`, proot, fakechroot, and a C compiler for the supervisor stay external, fetched or invoked
 on first use rather than bundled in.
 
 ## Supported platforms

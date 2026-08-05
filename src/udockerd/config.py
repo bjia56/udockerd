@@ -68,6 +68,19 @@ def check_curl_available() -> None:
         )
 
 
+def check_tar_available() -> None:
+    """Both udocker's own image-layer extraction (ContainerStructure via
+    udocker_ctx.py's proot-retry patch) and builder.py's COPY/ADD/layer-flatten
+    paths shell out to a bare `tar` on PATH. Checked at startup, same as
+    curl, so a missing tar fails loudly and immediately instead of surfacing
+    deep inside a request as a bare `[Errno 2] No such file or directory: 'tar'`.
+    """
+    if shutil.which("tar") is None:
+        raise RuntimeError(
+            "udockerd requires the 'tar' executable on PATH"
+        )
+
+
 def check_linux() -> None:
     """udockerd only runs on Linux (proot has no other target)."""
     if platform.system() != "Linux":

@@ -18,11 +18,13 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from typing import Any
 
 from udocker.config import Config
 from udocker.container.localrepo import LocalRepository
 from udocker.container.structure import ContainerStructure
 from udocker.docker import DockerIoAPI
+from udocker.engine.proot import PRootEngine
 from udocker.helper.hostinfo import HostInfo
 from udocker.msg import Msg
 from udocker.tools import UdockerTools
@@ -198,6 +200,93 @@ def _patch_untar_layers_proot_retry(local: LocalRepository) -> None:
     ContainerStructure._untar_layers = _patched_untar_layers  # noqa: SLF001
 
 
+def _isolated_proot_env(opt: Any) -> dict[str, str]:
+    """Non-mutating equivalent of ExecutionEngineCommon._run_env_cleanup_dict
+    (engine/base.py), which the version of PRootEngine.run() below normally
+    calls. Builds the same host-var-whitelist + container-env-merge result
+    as a fresh local dict, instead of deleting keys out of and then merging
+    into the real, process-wide os.environ.
+    """
+    if opt["hostenv"]:
+        run_env = dict(os.environ)
+    else:
+        run_env = {
+            var: os.environ[var]
+            for var in Config.conf["valid_host_env"]
+            if var in os.environ
+        }
+    for var in Config.conf["invalid_host_env"]:
+        run_env.pop(var, None)
+    run_env.update(opt["env"].dict())
+    return run_env
+
+
+def _patch_proot_env_isolation() -> None:
+    """Replaces PRootEngine.run() (engine/proot.py, udocker 1.3.17), which
+    ends by mutating the real process-wide os.environ via
+    `_run_env_cleanup_dict()` + `env=os.environ.update(...)`. Copies the
+    method verbatim except that tail, which is replaced with
+    `_isolated_proot_env()` above: a local dict passed via
+    `subprocess.call(env=...)`, never touching os.environ. Duplicates a
+    pinned-version internal method (`udocker==1.3.17` in pyproject.toml) --
+    re-diff against engine/proot.py on any version bump.
+    """
+
+    def _patched_run(self: PRootEngine, container_id: str) -> int:
+        if not self._run_init(container_id):  # noqa: SLF001
+            return 2
+
+        self.select_proot()
+
+        if self.proot_noseccomp or os.getenv("PROOT_NO_SECCOMP"):
+            self.opt["env"].append("PROOT_NO_SECCOMP=1")
+        if self.proot_newseccomp or os.getenv("PROOT_NEW_SECCOMP"):
+            self.opt["env"].append("PROOT_NEW_SECCOMP=1")
+
+        if not HostInfo().oskernel_isgreater([3, 0, 0]):
+            self._kernel = "6.0.0"  # noqa: SLF001
+        if self.opt["kernel"]:
+            self._kernel = self.opt["kernel"]  # noqa: SLF001
+
+        self._run_env_set()  # noqa: SLF001
+
+        proot_verbose = ["-v", "9"] if Msg.level >= Msg.DBG else []
+
+        if Config.conf["proot_link2symlink"] and self._has_option("--link2symlink"):  # noqa: SLF001
+            proot_link2symlink = ["--link2symlink"]
+        else:
+            proot_link2symlink = []
+
+        if Config.conf["proot_killonexit"] and self._has_option("--kill-on-exit"):  # noqa: SLF001
+            proot_kill_on_exit = ["--kill-on-exit"]
+        else:
+            proot_kill_on_exit = []
+
+        cmd_l = self._set_cpu_affinity()  # noqa: SLF001
+        cmd_l.append(self.executable)
+        cmd_l.extend(proot_verbose)
+        cmd_l.extend(proot_kill_on_exit)
+        cmd_l.extend(proot_link2symlink)
+        cmd_l.extend(self._get_qemu_string())  # noqa: SLF001
+        cmd_l.extend(self._get_volume_bindings())  # noqa: SLF001
+        cmd_l.extend(self._set_uid_map())  # noqa: SLF001
+        cmd_l.extend(["-k", self._kernel])  # noqa: SLF001
+        cmd_l.extend(self._get_network_map())  # noqa: SLF001
+        cmd_l.extend(["-r", self.container_root])
+
+        if self.opt["cwd"]:
+            cmd_l.extend(["-w", self.opt["cwd"]])
+        cmd_l.extend(self.opt["cmd"])
+        Msg().out("CMD =", cmd_l, l=Msg.VER)
+
+        run_env = _isolated_proot_env(self.opt)
+
+        self._run_banner(self.opt["cmd"][0])  # noqa: SLF001
+        return subprocess.call(cmd_l, shell=False, close_fds=False, env=run_env)
+
+    PRootEngine.run = _patched_run
+
+
 def _patch_msg_verbose_child_output() -> None:
     """Msg.__init__ fires on every bare `Msg()` call (hundreds of sites in
     udocker) and unconditionally resets chlderr/chldout to /dev/null,
@@ -262,6 +351,7 @@ def init(verbose: int = 0, quiet: bool = False) -> UdockerContext:
             raise RuntimeError("failed to install udocker execution tools (proot/fakechroot)")
 
         _patch_untar_layers_proot_retry(local)
+        _patch_proot_env_isolation()
 
         _context = UdockerContext(
             local=local,

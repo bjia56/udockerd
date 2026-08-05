@@ -8,7 +8,12 @@ if typing.TYPE_CHECKING:
     import io
 
 from udockerd import __version__, udocker_ctx
-from udockerd.config import check_curl_available, check_linux, configure_udocker
+from udockerd.config import (
+    check_curl_available,
+    check_linux,
+    check_tar_available,
+    configure_udocker,
+)
 from udockerd.server import serve
 
 logger = logging.getLogger("udockerd")
@@ -99,6 +104,7 @@ def main() -> int:
 
     check_linux()
     check_curl_available()
+    check_tar_available()
     configure_udocker(args.data_dir)
     udocker_ctx.init(verbose=args.verbose, quiet=args.quiet)
 
