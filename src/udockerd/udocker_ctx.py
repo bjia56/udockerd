@@ -230,7 +230,16 @@ def _patch_proot_env_isolation() -> None:
     `subprocess.call(env=...)`, never touching os.environ. Duplicates a
     pinned-version internal method (`udocker==1.3.17` in pyproject.toml) --
     re-diff against engine/proot.py on any version bump.
+
+    container_proc.py's Popen monkeypatch (`called_from_engine_run`)
+    frame-checks its caller's exact co_filename/co_name to tell the real
+    container-launch Popen call apart from udocker's incidental internal
+    ones -- without spoofing this replacement's code object back to the
+    original's, that check fails, the launch falls through to unpatched
+    Popen, and container output silently lands on the daemon's own
+    stdout/stderr instead of being captured for docker logs/attach.
     """
+    original_code = PRootEngine.run.__code__
 
     def _patched_run(self: PRootEngine, container_id: str) -> int:
         if not self._run_init(container_id):  # noqa: SLF001
@@ -284,6 +293,10 @@ def _patch_proot_env_isolation() -> None:
         self._run_banner(self.opt["cmd"][0])  # noqa: SLF001
         return subprocess.call(cmd_l, shell=False, close_fds=False, env=run_env)
 
+    _patched_run.__code__ = _patched_run.__code__.replace(
+        co_filename=original_code.co_filename,
+        co_name=original_code.co_name,
+    )
     PRootEngine.run = _patched_run
 
 
