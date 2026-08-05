@@ -31,5 +31,6 @@ def test_apply_default_opt_gives_each_engine_independent_lists() -> None:
 
     # Simulates udocker's own in-place mutation (e.g. _set_volume_bindings()
     # appending a hostauth bind-file entry for engine_a's container).
+    vol_b_before = list(engine_b.opt["vol"])
     engine_a.opt["vol"].append("engine-a-hostauth-file:/etc/group")
-    assert engine_b.opt["vol"] == []
+    assert engine_b.opt["vol"] == vol_b_before
