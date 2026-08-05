@@ -242,6 +242,64 @@ def remove(ctx: RequestContext) -> None:
     ctx.send_empty(204)
 
 
+def _dir_disk_usage(path: str) -> int:
+    """Real allocated disk usage (st_blocks * 512 — POSIX always counts
+    st_blocks in fixed 512-byte units, regardless of the filesystem's
+    actual block size), not logical file size — matches what `du`
+    reports rather than apparent size. Computed on-demand at delete
+    time rather than tracked live: proot/fakechroot write to a
+    container's ROOT with no hook this daemon can observe, so a
+    running counter would need the same walk anyway to stay correct,
+    just spread across every write instead of once here.
+
+    lstat (not stat): a symlink is counted by its own small allocation,
+    never by whatever it points to, so nothing outside the tree gets
+    pulled in and device/socket/fifo nodes just contribute ~0 blocks.
+    Dedup by (st_dev, st_ino): tar-extracted layers legitimately
+    contain hardlinked files (see docs/DESIGN.md's hardlink-extraction
+    section) — two names for the same inode share the same blocks, so
+    counting both would overstate what deleting the tree actually frees.
+    """
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fname in filenames:
+            with contextlib.suppress(OSError):
+                st = os.lstat(os.path.join(dirpath, fname))
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                total += st.st_blocks * 512
+    return total
+
+
+def prune(ctx: RequestContext) -> None:
+    """POST /containers/prune — removes every tracked non-running
+    container. `filters` (until/label) is accepted but ignored: no
+    label storage exists anywhere in the registry to filter against,
+    and this mirrors the same accepted-but-ignored treatment /build
+    already gives params it doesn't implement (see docs/DESIGN.md).
+    """
+    deleted: list[str] = []
+    space = 0
+    uctx = udocker_ctx.get()
+    for proc in list(container_proc.registry.all()):
+        if proc.status == "running":
+            continue
+        exec_routes.stop_execs_for(proc.container_id, grace_seconds=5)
+        container_dir = uctx.local.cd_container(proc.container_id)
+        if container_dir:
+            space += _dir_disk_usage(container_dir)
+        with uctx.lock:
+            uctx.local.del_container(proc.container_id, force=True)
+        container_proc.registry.remove(proc.container_id)
+        with contextlib.suppress(OSError):
+            os.remove(proc.logfile)
+        deleted.append(proc.container_id)
+    ctx.send_json(200, {"ContainersDeleted": deleted or None, "SpaceReclaimed": space})
+
+
 def list_containers(ctx: RequestContext) -> None:
     query = _query(ctx)
     show_all = query.get("all", ["0"])[0] in ("1", "true")
@@ -358,6 +416,7 @@ def wait(ctx: RequestContext) -> None:
 
 def register(router: Router) -> None:
     router.add("POST", r"^/containers/create$", create)
+    router.add("POST", r"^/containers/prune$", prune)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/start$", start)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/stop$", stop)
     router.add("POST", r"^/containers/(?P<id>[^/]+)/kill$", kill)

@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
-from udockerd import udocker_ctx
+from udockerd import container_proc, udocker_ctx
 
 if TYPE_CHECKING:
     from udockerd.http import RequestContext, Router
@@ -198,8 +198,58 @@ def remove(ctx: RequestContext) -> None:
     ctx.send_json(200, [{"Untagged": f"{imagerepo}:{tag}"}])
 
 
+def prune(ctx: RequestContext) -> None:
+    """POST /images/prune — dangling-only by default, all-unused with
+    `filters={"dangling":["false"]}` (what `docker image prune -a` /
+    `docker system prune -a` send).
+
+    There is no way for a truly dangling (untagged) image to exist in
+    this repo model: pulls always come from an explicit fromImage+tag,
+    and untagged builds synthesize a fallback `udockerd-build:<id>` tag
+    (see builder.py's commit_layer) rather than leaving an untagged
+    entry. So a plain dangling-only prune always legitimately finds
+    nothing — `-a`'s dangling=false is what drives real removal here:
+    any image not referenced by any tracked container (running or not).
+    `until`/`label` filters are accepted but ignored, same rationale as
+    /containers/prune.
+    """
+    query = parse_qs(urlsplit(ctx.path).query)
+    try:
+        filters = json.loads(query.get("filters", ["{}"])[0])
+    except ValueError:
+        filters = {}
+    dangling_only = "false" not in filters.get("dangling", ["true"])
+
+    deleted: list[dict[str, str]] = []
+    space = 0
+    if not dangling_only:
+        uctx = udocker_ctx.get()
+        # Whole scan-and-delete pass held under one lock: get_layers/
+        # del_imagerepo each internally cd_imagerepo (mutating the
+        # shared cursor), so interleaving with another request's own
+        # cd_imagerepo/setup_*/read sequence here would corrupt it —
+        # same hazard documented for builder.py's commit_layer.
+        with uctx.lock:
+            used = set()
+            for proc in container_proc.registry.all():
+                imagerepo, tag = udocker_ctx.split_imagespec(proc.image)
+                resolved = udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
+                if resolved is not None:
+                    used.add(resolved)
+            for imagerepo, tag in list(uctx.local.get_imagerepos()):
+                if (imagerepo, tag) in used or uctx.local.isprotected_imagerepo(imagerepo, tag):
+                    continue
+                layers = uctx.local.get_layers(imagerepo, tag)
+                layer_space = sum(layer_size for _, layer_size in layers if layer_size)
+                if uctx.local.del_imagerepo(imagerepo, tag, force=False):
+                    deleted.append({"Untagged": f"{imagerepo}:{tag}"})
+                    space += layer_space
+    ctx.send_json(200, {"ImagesDeleted": deleted or None, "SpaceReclaimed": space})
+
+
 def register(router: Router) -> None:
     router.add("POST", r"^/images/create$", create)
     router.add("GET", r"^/images/json$", list_images)
+    router.add("POST", r"^/images/prune$", prune)
     router.add("GET", r"^/images/(?P<name>[^/]+(?:/[^/]+)*)/json$", inspect)
     router.add("DELETE", r"^/images/(?P<name>[^/]+(?:/[^/]+)*)$", remove)

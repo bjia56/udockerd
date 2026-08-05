@@ -67,7 +67,8 @@ defaults to BuildKit, set `DOCKER_BUILDKIT=0`.
 `docker build`. It doesn't aim for full Docker parity.
 
 Implemented: container create/start/stop/rm/list/inspect/logs, exec, attach, TTY sessions, image
-pull/list/rm/inspect, and `docker build` (classic builder, one flattened layer per build, no build cache).
+pull/list/rm/inspect, `docker build` (classic builder, one flattened layer per build, no build cache), and
+`docker system prune [-a]` (containers/images pruned for real; networks/volumes/build-cache report empty).
 
 Not implemented: BuildKit, `HEALTHCHECK`/`ONBUILD`/`SHELL`/`--mount=`, remote or git build contexts,
 networks-as-objects, volumes-as-objects, swarm, and compose-level features.

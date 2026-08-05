@@ -55,6 +55,7 @@ Core container + image lifecycle, plus exec and attach/logs streaming:
 - `/containers/{id}/exec` + `/exec/{id}/start` (exec)
 - `/containers/{id}/attach` (attach/streaming)
 - `/images/create` (pull), `/images/json` (list), `/images/{name}` (rm), `/images/{name}/json` (inspect)
+- `/containers/prune`, `/images/prune`, `/networks/prune`, `/volumes/prune`, `/build/prune` (see Prune section below)
 - `/build` (design only, not yet implemented — see Build section below)
 - `/version`, `/info`, `/_ping`
 
@@ -81,6 +82,14 @@ Mechanics: each stage builds in a throwaway container via `ContainerStructure(uc
 New module: `routes/build.py` (`POST /build`) as thin request/response glue, backed by a new `builder.py` for Dockerfile parsing and stage execution — keeping the same split `container_proc.py`/routes already use.
 
 Explicitly out of scope, same tier as the list above: BuildKit protocol, build cache, per-instruction layers, `HEALTHCHECK`/`ONBUILD`/`SHELL`, remote/git build contexts, `--mount=`/secrets, cross-arch `--platform` builds, image squashing beyond the single-layer default.
+
+### Prune (`docker system prune`)
+
+`docker system prune [-a]` isn't one API call — the CLI drives a fixed sequence of per-resource prune endpoints (containers → networks → volumes (only with `--volumes`) → images → build cache). Verified against the harness with the real `docker` CLI: any non-`2xx` from any endpoint in that sequence aborts the whole command, even after earlier steps already succeeded — a `404`/`501` from `/build/prune` fails `system prune` outright rather than being skipped. So every endpoint in the sequence has to answer with a real `2xx`, even the ones backing features this daemon doesn't implement.
+
+- **`POST /containers/prune`**: real. Removes every tracked non-running container (`container_proc.registry`), same teardown as `/containers/{id}/rm`. `filters` (`until`/`label`) is accepted but ignored — no label storage exists anywhere in the registry to filter against, same "accept, don't implement" treatment `/build` already gives params like `nocache`/`squash`. `SpaceReclaimed` is always `0`: no per-container disk-usage accounting exists elsewhere in this codebase to compute it honestly.
+- **`POST /images/prune`**: real, and the "dangling vs all" distinction collapses to a `-a`-only path — pulls always come from an explicit `fromImage`+`tag`, and untagged builds synthesize a fallback `udockerd-build:<config-digest-prefix>` tag (`builder.py`'s `commit_layer`), so there is no way for a truly dangling (untagged) image to exist in this repo model. A plain `dangling=true` prune (default, no `-a`) therefore always legitimately finds nothing to remove — that's correct behavior, not a stub. `dangling=false` (what `-a` sends) is what actually drives removal: any image not referenced by any tracked container, running or not. The whole scan-and-delete pass runs under one `uctx.lock` span — `get_layers`/`del_imagerepo` each internally call `cd_imagerepo`, so, per the concurrency rule in `udocker_ctx.py`, interleaving with another request's own cursor-dependent sequence here would corrupt it. `until`/`label` filters: same accepted-but-ignored treatment as containers.
+- **`POST /networks/prune`, `POST /volumes/prune`, `POST /build/prune`**: always answer `200` with an empty deleted-list and no error — not stubs pretending to work, just the honest answer for "nothing here to prune" given networks/volumes-as-objects and build cache are all out of scope entirely (see Known scope boundaries and the Build section above). `/networks/prune` specifically has to exist and succeed unconditionally because the CLI calls it regardless of flags.
 
 ### Process tracking
 In-memory registry only: `{container_id: {pid, pgid, logfile, status, ...}}`. `docker run`/`exec` spawns the real proot-wrapped process via the udocker engine, monkeypatching `subprocess.Popen` for the scope of the engine's own `run()` call (it builds its command and calls `subprocess.call()` directly with no exposed hook — see `container_proc.py`). stdout/stderr redirected to a per-container log file. Daemon restart loses live state — acceptable, since the proot processes don't survive a daemon restart anyway.

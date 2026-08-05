@@ -58,8 +58,39 @@ def ping(ctx: RequestContext) -> None:
     ctx.wfile.write(b"OK")
 
 
+def networks_prune(ctx: RequestContext) -> None:
+    """POST /networks/prune — no networks-as-objects exist (see
+    CLAUDE.md scope boundaries), so nothing is ever deleted. Still
+    needs a real 200 here rather than 404: `docker system prune` calls
+    this endpoint unconditionally (not gated by `-a`/`--volumes`), and
+    the CLI aborts the whole command on any non-2xx/non-501 response.
+    """
+    ctx.send_json(200, {"NetworksDeleted": None})
+
+
+def volumes_prune(ctx: RequestContext) -> None:
+    """POST /volumes/prune — same rationale as networks_prune: no
+    volumes-as-objects exist, so nothing to delete. Only reached from
+    `docker system prune` when the client also passes `--volumes`.
+    """
+    ctx.send_json(200, {"VolumesDeleted": None, "SpaceReclaimed": 0})
+
+
+def build_prune(ctx: RequestContext) -> None:
+    """POST /build/prune — there is no build cache at all (one
+    flattened layer per build, no cache, see docs/DESIGN.md's Build
+    section). `docker system prune` requires a real 2xx here or it
+    aborts the whole command, so answer the honest empty result: no
+    cache entries exist, so none are deleted.
+    """
+    ctx.send_json(200, {"CachesDeleted": [], "SpaceReclaimed": 0})
+
+
 def register(router: Router) -> None:
     router.add("GET", r"^/version$", version)
     router.add("GET", r"^/info$", info)
     router.add("GET", r"^/_ping$", ping)
     router.add("HEAD", r"^/_ping$", ping)
+    router.add("POST", r"^/networks/prune$", networks_prune)
+    router.add("POST", r"^/volumes/prune$", volumes_prune)
+    router.add("POST", r"^/build/prune$", build_prune)

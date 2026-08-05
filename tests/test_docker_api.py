@@ -320,3 +320,106 @@ def test_docker_run_bad_exec_reports_error_and_does_not_hang(harness_port: int) 
         env={"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"},
         capture_output=True,
     )
+
+
+def test_system_prune_all_removes_stopped_container_and_unused_image(
+    harness_port: int,
+) -> None:
+    """The real end-to-end use case: `docker system prune -a -f` as the
+    docker CLI actually drives it (containers -> networks -> volumes
+    -> images -> build cache, five separate API calls). Uses a
+    throwaway image distinct from the session-shared `alpine` fixture
+    so this doesn't disturb other tests. Placed last in the file since
+    -a legitimately removes any image not referenced by a container.
+
+    Checks removal via `docker inspect` on the specific container/image
+    id rather than `docker ps --filter`/`docker images <ref>`: neither
+    /containers/json nor /images/json here honor the `filters` query
+    param, so those would silently return the harness's full (and
+    test-order-dependent) container/image set instead of a filtered one.
+    """
+    env = {"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"}
+    prune_image = "busybox:latest"
+    name = _unique_name("pruneme")
+
+    subprocess.run(["docker", "pull", prune_image], env=env, check=True, capture_output=True)
+    run = subprocess.run(
+        ["docker", "run", "-d", "--name", name, prune_image, "true"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    container_id = run.stdout.strip()
+    subprocess.run(
+        ["docker", "wait", container_id], env=env, check=True, capture_output=True, timeout=15
+    )
+
+    result = subprocess.run(
+        ["docker", "system", "prune", "-a", "-f", "--volumes"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+    inspect_container = subprocess.run(
+        ["docker", "inspect", container_id], env=env, capture_output=True, text=True
+    )
+    assert inspect_container.returncode != 0
+
+    inspect_image = subprocess.run(
+        ["docker", "inspect", prune_image], env=env, capture_output=True, text=True
+    )
+    assert inspect_image.returncode != 0
+
+
+def test_system_prune_all_does_not_remove_running_container_or_its_image(
+    harness_port: int,
+) -> None:
+    """/containers/prune must only remove non-running containers
+    (real docker's `container prune` semantic — `docker ps -a` still
+    shows a running container as unprunable). Also confirms the
+    `-a` image-prune path treats a running container's image as
+    "in use": it must survive even though nothing else references it.
+    """
+    env = {"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"}
+    prune_image = "busybox:latest"
+    name = _unique_name("keepme")
+
+    subprocess.run(["docker", "pull", prune_image], env=env, check=True, capture_output=True)
+    run = subprocess.run(
+        ["docker", "run", "-d", "--name", name, prune_image, "sleep", "30"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    container_id = run.stdout.strip()
+
+    try:
+        result = subprocess.run(
+            ["docker", "system", "prune", "-a", "-f", "--volumes"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+
+        running = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert running.returncode == 0, running.stderr
+        assert running.stdout.strip() == "true"
+
+        inspect_image = subprocess.run(
+            ["docker", "inspect", prune_image], env=env, capture_output=True, text=True
+        )
+        assert inspect_image.returncode == 0, inspect_image.stderr
+    finally:
+        subprocess.run(["docker", "rm", "-f", container_id], env=env, capture_output=True)
