@@ -13,7 +13,8 @@ pip install udockerd
 ```
 
 Requires Python 3.12+ and a `curl` executable on `PATH` (Termux: `pkg install curl`, often preinstalled elsewhere).
-udocker downloads its own proot/fakechroot execution backends the first time it needs them.
+udocker downloads its own proot/fakechroot execution backends the first time it needs them, however on Termux it is
+strongly recommended to install the official Termux proot package for best compatibility.
 
 A self-contained [Cosmopolitan Libc](https://github.com/jart/cosmopolitan) build is also produced by CI as a single
 multiplatform executable, requiring no host Python dependency at runtime.
