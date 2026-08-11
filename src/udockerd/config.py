@@ -83,7 +83,7 @@ def check_tar_available() -> None:
 
 def check_linux() -> None:
     """udockerd only runs on Linux (proot has no other target)."""
-    if platform.system() != "Linux":
+    if platform.system() not in ["Linux", "Android"]:
         raise RuntimeError(
-            f"udockerd only runs on Linux (detected: {platform.system()})"
+            f"udockerd only runs on Linux/Android (detected: {platform.system()})"
         )
