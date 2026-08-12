@@ -166,7 +166,7 @@ def test_container_name_conflict_rejected(client: docker.DockerClient) -> None:
     try:
         with pytest.raises(docker.errors.APIError) as excinfo:
             client.containers.create(IMAGE, command=["sleep", "5"], name=name)
-        assert excinfo.value.response.status_code == 409
+        assert excinfo.value.status_code == 409
     finally:
         first.remove()
 
