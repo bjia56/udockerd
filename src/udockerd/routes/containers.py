@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -74,6 +75,7 @@ def _inspect_json(proc: ContainerProc) -> dict[str, Any]:
             # logfile, not a driver plugin); docker-py's containers.run()
             # reads this to decide how to fetch non-detached run() output.
             "LogConfig": {"Type": "json-file", "Config": {}},
+            "AutoRemove": proc.auto_remove,
         },
         "NetworkSettings": _network_settings(),
     }
@@ -118,6 +120,13 @@ def _opt_from_image_config(uctx: udocker_ctx.UdockerContext) -> dict[str, Any]:
     return container_proc.opt_from_request_body(config)
 
 
+def _name_conflict_message(name: str) -> str:
+    return (
+        f'Conflict. The container name "/{name}" is already in use. '
+        "You have to remove (or rename) that container to be able to reuse that name."
+    )
+
+
 def create(ctx: RequestContext) -> None:
     query = _query(ctx)
     name = query.get("name", [""])[0]
@@ -130,6 +139,22 @@ def create(ctx: RequestContext) -> None:
     imagerepo, tag = udocker_ctx.split_imagespec(image)
     uctx = udocker_ctx.get()
     with uctx.lock:
+        if name and container_proc.registry.get(name) is not None:
+            ctx.send_json(409, {"message": _name_conflict_message(name)})
+            return
+        if name:
+            # A name symlink can exist on disk with nothing in the registry
+            # behind it: this daemon never reloads container state at
+            # startup, so nothing survives a restart anyway -- an orphaned
+            # link like this is garbage from a previous daemon lifetime,
+            # not a live conflict. Reap it so the name is free to reuse
+            # (matching this daemon's per-process notion of "container
+            # exists" instead of getting the operator permanently stuck on
+            # a name no route can see to remove).
+            stale_id = uctx.local.get_container_id(name)
+            if stale_id:
+                uctx.local.del_container(stale_id, force=True)
+
         resolved = udocker_ctx.resolve_imagerepo(uctx, imagerepo, tag)
         if resolved is None:
             ctx.send_json(404, {"message": f"No such image: {image}"})
@@ -146,6 +171,7 @@ def create(ctx: RequestContext) -> None:
 
     display_name = name or container_id
     opt = {**image_opt, **container_proc.opt_from_request_body(body)}
+    host_config = body.get("HostConfig") or {}
     proc = container_proc.ContainerProc(
         container_id=container_id,
         name=display_name,
@@ -153,6 +179,7 @@ def create(ctx: RequestContext) -> None:
         logfile=str(_LOG_DIR / f"{container_id}.log"),
         opt=opt,
         tty=bool(body.get("Tty")),
+        auto_remove=bool(host_config.get("AutoRemove")),
     )
     container_proc.registry.add(proc)
 
@@ -178,8 +205,12 @@ def start(ctx: RequestContext) -> None:
         # engine.run() raised before ever exec'ing (e.g. bad Cmd/Entrypoint):
         # real dockerd reports this synchronously from /start rather than
         # leaving the client to wait on a container that never started.
+        if proc.auto_remove:
+            _purge_proc(proc, force=True)
         ctx.send_json(500, {"message": f"OCI runtime create failed: {error}"})
         return
+    if proc.auto_remove:
+        threading.Thread(target=_auto_remove_watcher, args=(proc,), daemon=True).start()
     ctx.send_empty(204)
 
 
@@ -215,6 +246,32 @@ def kill(ctx: RequestContext) -> None:
     ctx.send_empty(204)
 
 
+def _purge_proc(proc: ContainerProc, force: bool) -> None:
+    """Tears down a container's udocker on-disk tree, exec sessions, and
+    registry entry. Shared by the explicit DELETE route and the
+    AutoRemove-on-exit watcher started from start().
+    """
+    exec_routes.stop_execs_for(proc.container_id, grace_seconds=5)
+    uctx = udocker_ctx.get()
+    with uctx.lock:
+        uctx.local.del_container(proc.container_id, force=force)
+    container_proc.registry.remove(proc.container_id)
+    with contextlib.suppress(OSError):
+        os.remove(proc.logfile)
+
+
+def _auto_remove_watcher(proc: ContainerProc) -> None:
+    """Background thread started by start() for AutoRemove containers:
+    waits for the container to exit, then purges it -- mirrors `docker run
+    --rm`. Runs after /wait's read of exit_code, since notify_all() there
+    only wakes waiters, it doesn't race their read of proc fields (the proc
+    object itself outlives its registry entry).
+    """
+    with proc.lock:
+        proc.lock.wait_for(lambda: proc.status == "exited")
+    _purge_proc(proc, force=True)
+
+
 def remove(ctx: RequestContext) -> None:
     container_id = ctx.params["id"]
     query = _query(ctx)
@@ -231,14 +288,7 @@ def remove(ctx: RequestContext) -> None:
         return
     if proc.status == "running":
         container_proc.stop(proc, grace_seconds=5)
-    exec_routes.stop_execs_for(proc.container_id, grace_seconds=5)
-
-    uctx = udocker_ctx.get()
-    with uctx.lock:
-        uctx.local.del_container(proc.container_id, force=force)
-    container_proc.registry.remove(proc.container_id)
-    with contextlib.suppress(OSError):
-        os.remove(proc.logfile)
+    _purge_proc(proc, force=force)
     ctx.send_empty(204)
 
 

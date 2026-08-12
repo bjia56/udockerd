@@ -198,6 +198,10 @@ class ContainerProc:
     # Condition, not Lock: /wait blocks on notify_all() instead of polling.
     lock: threading.Condition = field(default_factory=threading.Condition)
 
+    # HostConfig.AutoRemove from /containers/create; consumed by
+    # routes/containers.py's start() to remove the container once it exits.
+    auto_remove: bool = False
+
     tty: bool = False
     pty_master_fd: int | None = None
     pty_lock: threading.Lock = field(default_factory=threading.Lock)

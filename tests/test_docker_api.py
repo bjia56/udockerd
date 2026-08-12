@@ -102,6 +102,25 @@ def test_container_wait(client: docker.DockerClient) -> None:
     container.remove()
 
 
+def test_container_auto_remove_removes_after_exit(client: docker.DockerClient) -> None:
+    """Regression guard: HostConfig.AutoRemove was parsed nowhere, so
+    `docker run --rm` left the exited container behind forever.
+    """
+    name = _unique_name("autorm")
+    container = client.containers.run(
+        IMAGE, command=["true"], name=name, detach=True, auto_remove=True
+    )
+    assert container.attrs["HostConfig"]["AutoRemove"] is True
+    container.wait()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not any(c.name == name for c in client.containers.list(all=True)):
+            return
+        time.sleep(0.1)
+    pytest.fail(f"container {name!r} was not auto-removed after exit")
+
+
 def test_container_exec(client: docker.DockerClient) -> None:
     name = _unique_name("exec")
     container = client.containers.run(IMAGE, command=["sleep", "30"], name=name, detach=True)
@@ -135,6 +154,34 @@ def test_container_kill(client: docker.DockerClient) -> None:
     container.reload()
     assert container.status == "exited"
     container.remove()
+
+
+def test_container_name_conflict_rejected(client: docker.DockerClient) -> None:
+    """Regression guard: create() used to ignore set_container_name()'s
+    return value and never checked the registry, so `docker run --name X`
+    twice silently produced two containers both answering to X.
+    """
+    name = _unique_name("dupname")
+    first = client.containers.create(IMAGE, command=["sleep", "5"], name=name)
+    try:
+        with pytest.raises(docker.errors.APIError) as excinfo:
+            client.containers.create(IMAGE, command=["sleep", "5"], name=name)
+        assert excinfo.value.response.status_code == 409
+    finally:
+        first.remove()
+
+
+def test_container_name_reusable_after_removal(client: docker.DockerClient) -> None:
+    """A name freed by an explicit remove() must be reusable, not
+    permanently stuck behind the conflict check above.
+    """
+    name = _unique_name("reuse")
+    first = client.containers.create(IMAGE, command=["sleep", "5"], name=name)
+    first.remove()
+
+    second = client.containers.create(IMAGE, command=["sleep", "5"], name=name)
+    assert second.name == name
+    second.remove()
 
 
 def test_container_start_bad_exec_reports_error(client: docker.DockerClient) -> None:
@@ -217,6 +264,36 @@ def test_docker_run_foreground_attaches(harness_port: int) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "attach output" in result.stdout
+
+
+def test_docker_run_rm_flag_removes_container(harness_port: int) -> None:
+    """End-to-end via the real docker CLI: `docker run --rm` must leave no
+    trace in `docker ps -a` once the container exits.
+    """
+    name = _unique_name("clirm")
+    env = {"DOCKER_HOST": f"tcp://127.0.0.1:{harness_port}", "PATH": "/usr/bin:/bin"}
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--name", name, IMAGE, "true"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        ps = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if name not in ps.stdout.split():
+            return
+        time.sleep(0.1)
+    pytest.fail(f"container {name!r} still present in `docker ps -a` after --rm")
 
 
 def test_container_tty_logs_capture_output(client: docker.DockerClient) -> None:
